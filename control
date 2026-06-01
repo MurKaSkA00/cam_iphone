@@ -1,0 +1,9 @@
+Package: com.proximacore.mediaplaybackutils
+Name: Media Playback Utilities
+Depends: mobilesubstrate, preferenceloader
+Version: 1.4.2
+Architecture: iphoneos-arm64
+Description: Low-level media playback helper for AVFoundation pipelines
+Maintainer: ProximaCore
+Author: ProximaCore
+Section: System
