@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>Playback Settings</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>default</key>
+            <true/>
+            <key>defaults</key>
+            <string>com.proximacore.mediaplaybackutils</string>
+            <key>key</key>
+            <string>enabled</string>
+            <key>label</key>
+            <string>Enabled</string>
+            <key>PostNotification</key>
+            <string>com.proximacore.mpu/cfg</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>Source URL</string>
+            <key>footerText</key>
+            <string>HTTP stream or .m3u8 playlist URL.</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSEditTextCell</string>
+            <key>default</key>
+            <string>http://192.168.1.44:8888/live</string>
+            <key>defaults</key>
+            <string>com.proximacore.mediaplaybackutils</string>
+            <key>key</key>
+            <string>rtspURL</string>
+            <key>keyboard</key>
+            <string>URL</string>
+            <key>autoCapsType</key>
+            <integer>0</integer>
+            <key>autoCorrectionType</key>
+            <integer>0</integer>
+            <key>PostNotification</key>
+            <string>com.proximacore.mpu/cfg</string>
+        </dict>
+    </array>
+    <key>title</key>
+    <string>Media Playback</string>
+</dict>
+</plist>
