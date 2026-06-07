@@ -1,4 +1,10 @@
-// MediaBufferAdapter.m - MediaPlaybackUtils v1.4.2
+// MediaBufferAdapter.m - MediaPlaybackUtils v1.4.2 [FIXED]
+// Исправления:
+//   1. [FIX #2] Reconnect при ошибке больше не создаёт несколько параллельных сессий:
+//      теперь всегда вызывается stopHTTPStream перед startHTTPStream.
+//      Добавлен флаг _reconnectScheduled чтобы несколько ошибок подряд не ставили
+//      несколько отложенных вызовов reconnect.
+
 #import "_MPUMediaBufferAdapter.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
@@ -7,20 +13,19 @@
 #import <MobileCoreServices/MobileCoreServices.h>
 
 @interface _MPUMediaBufferAdapter ()
-@property (nonatomic, strong) NSURLSession *session;
-@property (nonatomic, strong) NSURLSessionDataTask *task;
-@property (nonatomic, strong) NSMutableData *imageData;
-@property (nonatomic, assign) NSUInteger parseCursor;
-@property (nonatomic, assign) BOOL isRunning;
-
-@property (nonatomic, strong) AVPlayer *hlsPlayer;
-@property (nonatomic, strong) AVPlayerItem *hlsPlayerItem;
+@property (nonatomic, strong) NSURLSession          *session;
+@property (nonatomic, strong) NSURLSessionDataTask  *task;
+@property (nonatomic, strong) NSMutableData         *imageData;
+@property (nonatomic, assign) NSUInteger             parseCursor;
+@property (nonatomic, assign) BOOL                   isRunning;
+@property (nonatomic, assign) BOOL                   reconnectScheduled;   // [FIX #2]
+@property (nonatomic, strong) AVPlayer               *hlsPlayer;
+@property (nonatomic, strong) AVPlayerItem           *hlsPlayerItem;
 @property (nonatomic, strong) AVPlayerItemVideoOutput *videoOutput;
-@property (nonatomic, strong) CADisplayLink *displayLink;
-@property (nonatomic, assign) BOOL isHLS;
-
-@property (nonatomic, strong) CIContext *ciContext;
-@property (nonatomic, assign, readwrite) BOOL isConnecting;
+@property (nonatomic, strong) CADisplayLink          *displayLink;
+@property (nonatomic, assign) BOOL                   isHLS;
+@property (nonatomic, strong) CIContext              *ciContext;
+@property (nonatomic, assign, readwrite) BOOL         isConnecting;
 @end
 
 @implementation _MPUMediaBufferAdapter
@@ -28,18 +33,19 @@
 - (instancetype)initWithURL:(NSURL *)url {
     self = [super init];
     if (self) {
-        _streamURL = url;
-        _isConnecting = NO;
-        _frameCount = 0;
-        _lastFrameTime = 0;
-        _parseCursor = 0;
-        _ciContext = [CIContext contextWithOptions:nil];
+        _streamURL          = url;
+        _isConnecting       = NO;
+        _frameCount         = 0;
+        _lastFrameTime      = 0;
+        _parseCursor        = 0;
+        _reconnectScheduled = NO;
+        _ciContext          = [CIContext contextWithOptions:nil];
 
-        // HLS определяем только по .m3u8 в path (а не во всей строке)
         NSString *path = url.path.lowercaseString ?: @"";
         _isHLS = [path hasSuffix:@".m3u8"];
 
-        NSLog(@"[MPUAdapter] Initialized with URL: %@, type: %@", url, _isHLS ? @"HLS" : @"HTTP");
+        NSLog(@"[MPUAdapter] Initialized with URL: %@, type: %@",
+              url, _isHLS ? @"HLS" : @"HTTP");
     }
     return self;
 }
@@ -49,11 +55,9 @@
         NSLog(@"[MPUAdapter] Already streaming");
         return;
     }
-
-    _isRunning = YES;
+    _isRunning    = YES;
     _isConnecting = YES;
     NSLog(@"[MPUAdapter] Starting %@ stream...", _isHLS ? @"HLS" : @"HTTP");
-
     if (_isHLS) {
         [self startHLSStream];
     } else {
@@ -63,9 +67,8 @@
 
 - (void)stopStreaming {
     NSLog(@"[MPUAdapter] Stopping stream...");
-    _isRunning = NO;
+    _isRunning    = NO;
     _isConnecting = NO;
-
     if (_isHLS) {
         [self stopHLSStream];
     } else {
@@ -80,20 +83,20 @@
 - (void)startHLSStream {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.hlsPlayerItem = [AVPlayerItem playerItemWithURL:self.streamURL];
-        self.hlsPlayer = [AVPlayer playerWithPlayerItem:self.hlsPlayerItem];
+        self.hlsPlayer     = [AVPlayer playerWithPlayerItem:self.hlsPlayerItem];
         self.hlsPlayer.automaticallyWaitsToMinimizeStalling = NO;
         self.hlsPlayer.muted = YES;
 
         NSDictionary *pba = @{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferPixelFormatTypeKey:     @(kCVPixelFormatType_32BGRA),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
         };
-
         self.videoOutput = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pba];
         [self.hlsPlayerItem addOutput:self.videoOutput];
         [self.hlsPlayer play];
 
-        self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkCallback:)];
+        self.displayLink = [CADisplayLink displayLinkWithTarget:self
+                                                       selector:@selector(displayLinkCallback:)];
         self.displayLink.preferredFramesPerSecond = 30;
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
@@ -104,7 +107,6 @@
                                                  selector:@selector(playerItemDidReachEnd:)
                                                      name:AVPlayerItemDidPlayToEndTimeNotification
                                                    object:self.hlsPlayerItem];
-
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(playerItemFailed:)
                                                      name:AVPlayerItemFailedToPlayToEndTimeNotification
@@ -118,7 +120,8 @@
     CMTime currentTime = [self.hlsPlayer currentTime];
     if (![self.videoOutput hasNewPixelBufferForItemTime:currentTime]) return;
 
-    CVPixelBufferRef pixelBuffer = [self.videoOutput copyPixelBufferForItemTime:currentTime itemTimeForDisplay:nil];
+    CVPixelBufferRef pixelBuffer = [self.videoOutput copyPixelBufferForItemTime:currentTime
+                                                             itemTimeForDisplay:nil];
     if (!pixelBuffer) return;
 
     self->_frameCount++;
@@ -131,15 +134,12 @@
     }
 
     if (self.frameCallback) {
-        CIImage *ciImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
-        CGImageRef cgImage = [self.ciContext createCGImage:ciImage fromRect:ciImage.extent];
-        UIImage *image = cgImage ? [UIImage imageWithCGImage:cgImage] : nil;
+        CIImage    *ciImage  = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+        CGImageRef  cgImage  = [self.ciContext createCGImage:ciImage fromRect:ciImage.extent];
+        UIImage    *image    = cgImage ? [UIImage imageWithCGImage:cgImage] : nil;
         if (cgImage) CGImageRelease(cgImage);
         CVPixelBufferRelease(pixelBuffer);
-
-        if (image) {
-            self.frameCallback(image);
-        }
+        if (image) self.frameCallback(image);
     } else {
         CVPixelBufferRelease(pixelBuffer);
     }
@@ -167,26 +167,26 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] removeObserver:self];
         [self.displayLink invalidate];
-        self.displayLink = nil;
+        self.displayLink  = nil;
         [self.hlsPlayer pause];
-        self.hlsPlayer = nil;
+        self.hlsPlayer     = nil;
         self.hlsPlayerItem = nil;
-        self.videoOutput = nil;
+        self.videoOutput   = nil;
     });
 }
 
 // ========================================
-// HTTP STREAM HANDLING
+// HTTP / MJPEG STREAM HANDLING
 // ========================================
 
 - (void)startHTTPStream {
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    config.timeoutIntervalForRequest = 30.0;
-    config.timeoutIntervalForResource = 0; // бесконечный поток
+    config.timeoutIntervalForRequest  = 30.0;
+    config.timeoutIntervalForResource = 0;   // бесконечный поток
     config.HTTPMaximumConnectionsPerHost = 1;
 
-    self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
-    self.imageData = [NSMutableData data];
+    self.session    = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+    self.imageData  = [NSMutableData data];
     self.parseCursor = 0;
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:self.streamURL];
@@ -194,7 +194,6 @@
 
     self.task = [self.session dataTaskWithRequest:request];
     [self.task resume];
-
     NSLog(@"[MPUAdapter] HTTP stream task started");
 }
 
@@ -202,9 +201,9 @@
     [self.task cancel];
     self.task = nil;
     [self.session invalidateAndCancel];
-    self.session = nil;
-    self.imageData = nil;
-    self.parseCursor = 0;
+    self.session      = nil;
+    self.imageData    = nil;
+    self.parseCursor  = 0;
 }
 
 - (void)URLSession:(NSURLSession *)session
@@ -215,6 +214,10 @@ didReceiveResponse:(NSURLResponse *)response
     NSLog(@"[MPUAdapter] HTTP connected successfully");
     ch(NSURLSessionResponseAllow);
 }
+
+// ----------------------------------------
+// JPEG из данных → CVPixelBufferRef
+// ----------------------------------------
 
 - (CVPixelBufferRef)pixelBufferFromJPEGData:(NSData *)jpegData CF_RETURNS_RETAINED {
     CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)jpegData, NULL);
@@ -228,9 +231,9 @@ didReceiveResponse:(NSURLResponse *)response
     size_t h = CGImageGetHeight(cg);
 
     NSDictionary *opts = @{
-        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGImageCompatibilityKey:         @YES,
         (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        (id)kCVPixelBufferIOSurfacePropertiesKey:           @{}
     };
 
     CVPixelBufferRef pb = NULL;
@@ -241,24 +244,26 @@ didReceiveResponse:(NSURLResponse *)response
     }
 
     CVPixelBufferLockBaseAddress(pb, 0);
-    void *base = CVPixelBufferGetBaseAddress(pb);
-    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    void   *base = CVPixelBufferGetBaseAddress(pb);
+    size_t  bpr  = CVPixelBufferGetBytesPerRow(pb);
 
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs,
-                                             kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
+    CGContextRef    ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs,
+                                                kCGImageAlphaPremultipliedFirst |
+                                                kCGBitmapByteOrder32Little);
     CGColorSpaceRelease(cs);
-
     if (ctx) {
         CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
         CGContextRelease(ctx);
     }
-
     CVPixelBufferUnlockBaseAddress(pb, 0);
     CGImageRelease(cg);
-
     return pb;
 }
+
+// ----------------------------------------
+// Приём данных — MJPEG парсер
+// ----------------------------------------
 
 - (void)URLSession:(NSURLSession *)session
           dataTask:(NSURLSessionDataTask *)dataTask
@@ -272,7 +277,6 @@ didReceiveResponse:(NSURLResponse *)response
     NSData *startMarker = [NSData dataWithBytesNoCopy:(void *)SOI length:2 freeWhenDone:NO];
     NSData *endMarker   = [NSData dataWithBytesNoCopy:(void *)EOI length:2 freeWhenDone:NO];
 
-    // Парсим все полные JPEG-кадры в буфере, ищем с parseCursor (O(N) суммарно)
     while (YES) {
         NSUInteger len = self.imageData.length;
         if (self.parseCursor >= len) break;
@@ -280,24 +284,20 @@ didReceiveResponse:(NSURLResponse *)response
         NSRange searchRange = NSMakeRange(self.parseCursor, len - self.parseCursor);
         NSRange sRange = [self.imageData rangeOfData:startMarker options:0 range:searchRange];
         if (sRange.location == NSNotFound) {
-            // нет SOI — отбросить весь хвост (мусор), оставить последний байт на случай "FF" в конце
-            if (len > 1) {
+            if (len > 1)
                 [self.imageData replaceBytesInRange:NSMakeRange(0, len - 1) withBytes:NULL length:0];
-            }
             self.parseCursor = 0;
             break;
         }
 
         NSRange afterSOI = NSMakeRange(sRange.location + 2, len - (sRange.location + 2));
-        NSRange eRange = [self.imageData rangeOfData:endMarker options:0 range:afterSOI];
+        NSRange eRange   = [self.imageData rangeOfData:endMarker options:0 range:afterSOI];
         if (eRange.location == NSNotFound) {
-            // EOI ещё не пришёл, ждём следующий чанк
             self.parseCursor = sRange.location;
             break;
         }
 
-        NSRange imgRange = NSMakeRange(sRange.location,
-                                       eRange.location + 2 - sRange.location);
+        NSRange imgRange = NSMakeRange(sRange.location, eRange.location + 2 - sRange.location);
         NSData *jpeg = [self.imageData subdataWithRange:imgRange];
 
         if (self.pixelBufferCallback) {
@@ -319,7 +319,6 @@ didReceiveResponse:(NSURLResponse *)response
             }
         }
 
-        // удалить разобранный кадр из буфера
         [self.imageData replaceBytesInRange:NSMakeRange(0, eRange.location + 2)
                                   withBytes:NULL length:0];
         self.parseCursor = 0;
@@ -331,6 +330,10 @@ didReceiveResponse:(NSURLResponse *)response
         NSLog(@"[MPUAdapter] Buffer overflow (>16MB), cleared");
     }
 }
+
+// ----------------------------------------
+// Обработка завершения / ошибки
+// ----------------------------------------
 
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
@@ -344,11 +347,16 @@ didCompleteWithError:(NSError *)error {
             });
         }
 
-        if (self.isRunning) {
+        // [FIX #2] Защита от дублирующихся reconnect при серии ошибок подряд
+        if (self.isRunning && !self.reconnectScheduled) {
+            self.reconnectScheduled = YES;
             NSLog(@"[MPUAdapter] Reconnecting in 3s...");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
+                self.reconnectScheduled = NO;
                 if (self.isRunning) {
+                    // Явно чистим старую сессию перед стартом новой
+                    [self stopHTTPStream];
                     [self startHTTPStream];
                 }
             });
