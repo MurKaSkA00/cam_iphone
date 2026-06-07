@@ -131,7 +131,7 @@ static void _v_startDisplayLink(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             _MPUDisplayLinkTarget *target = [_MPUDisplayLinkTarget new];
             // Держим target живым через ассоциацию с AppDelegate или статику
-            static _MPUDisplayLinkTarget *_keepAlive;
+            static _MPUDisplayLinkTarget *_keepAlive __attribute__((unused));
             _keepAlive = target;
 
             _v_displayLink = [CADisplayLink displayLinkWithTarget:target selector:@selector(tick:)];
