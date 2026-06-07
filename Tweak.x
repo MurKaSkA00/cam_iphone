@@ -14,7 +14,14 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import "_MPUMediaBufferAdapter.h"
-#import "FrameProcessor.h"
+
+// FrameProcessor forward — объявляем только то, что нам нужно,
+// чтобы не зависеть от порядка компиляции .h при Logos-preprocessing
+@interface _MPUFrameProcessor : NSObject
++ (instancetype)sharedProcessor;
+- (CVPixelBufferRef _Nullable)processBuffer:(CVPixelBufferRef)src CF_RETURNS_RETAINED;
+- (CMSampleTimingInfo)jitteredTimingFromTiming:(CMSampleTimingInfo)t;
+@end
 
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
