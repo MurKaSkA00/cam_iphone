@@ -6,6 +6,7 @@
 
 #import "FrameProcessor.h"
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
 #import <stdlib.h>
 #import <string.h>
