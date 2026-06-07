@@ -1,4 +1,5 @@
-// FrameProcessor.h - MediaPlaybackUtils v1.4.2
+// FrameProcessor.h - MediaPlaybackUtils v1.4.2 (fixed)
+
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
@@ -9,8 +10,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)sharedProcessor;
 
-- (CVPixelBufferRef _Nullable)processBuffer:(CVPixelBufferRef)src CF_RETURNS_RETAINED;
-- (CMSampleTimingInfo)jitteredTimingFromTiming:(CMSampleTimingInfo)t;
+/// Конвертирует CVPixelBuffer в BGRA + IOSurface-backed буфер.
+/// Если буфер уже в нужном формате — просто retain.
+/// Возвращает retained буфер (caller должен CVPixelBufferRelease).
+- (CVPixelBufferRef)processBuffer:(CVPixelBufferRef)src CF_RETURNS_RETAINED;
 
 @end
 
