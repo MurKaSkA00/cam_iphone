@@ -8,6 +8,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface _MPUFrameProcessor : NSObject
 
 + (instancetype)sharedProcessor;
+
 - (CVPixelBufferRef _Nullable)processBuffer:(CVPixelBufferRef)src CF_RETURNS_RETAINED;
 - (CMSampleTimingInfo)jitteredTimingFromTiming:(CMSampleTimingInfo)t;
 
