@@ -1,83 +1,3 @@
-// AntifraudHooks.x - MediaPlaybackUtils v1.4.6
-
-#import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
-#import <AVFoundation/AVFoundation.h>
-#import <QuartzCore/QuartzCore.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import <substrate.h>
-
-extern const void *kOverlayLayerKey;
-
-static NSString *(*orig_NSStringFromClass)(Class) = NULL;
-static NSString *hook_NSStringFromClass(Class cls) {
-    NSString *r = orig_NSStringFromClass(cls);
-    if (!r) return r;
-    if ([r hasSuffix:@"_MPU"]) {
-        return [r substringToIndex:r.length - 4];
-    }
-    return r;
-}
-
-%hook AVCaptureVideoPreviewLayer
-
-- (NSArray<CALayer *> *)sublayers {
-    NSArray<CALayer *> *orig = %orig;
-    if (!orig) return orig;
-    CALayer *overlay = objc_getAssociatedObject(self, kOverlayLayerKey);
-    if (!overlay) return orig;
-    NSMutableArray *clean = [orig mutableCopy];
-    [clean removeObject:overlay];
-    return clean;
-}
-
-%end
-
-%ctor {
-    @autoreleasepool {
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        if (!bid) return;
-        if ([bid hasPrefix:@"com.apple.springboard"]) return;
-
-        MSHookFunction((void *)NSStringFromClass,
-                       (void *)hook_NSStringFromClass,
-                       (void **)&orig_NSStringFromClass);
-
-        %init;
-        NSLog(@"[MPU/AntiIntrospect] Installed for %@", bid);
-    }
-}
-<<<КОНЕЦ AntifraudHooks.x>>>
-
-📄 Файл 3 — MediaPlaybackUtils.plist
-<<<НАЧАЛО MediaPlaybackUtils.plist>>>
-
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Filter</key>
-  <dict>
-    <key>Classes</key>
-    <array>
-      <string>AVCaptureSession</string>
-      <string>AVCaptureVideoDataOutput</string>
-      <string>AVCapturePhotoOutput</string>
-      <string>AVSampleBufferDisplayLayer</string>
-      <string>AVCaptureVideoPreviewLayer</string>
-    </array>
-    <key>Mode</key>
-    <string>Any</string>
-  </dict>
-</dict>
-</plist>
-<<<КОНЕЦ MediaPlaybackUtils.plist>>>
-
-📄 Файл 4 — MediaBufferAdapter.m
-<<<НАЧАЛО MediaBufferAdapter.m>>>
-
 // MediaBufferAdapter.m - MediaPlaybackUtils v1.4.6
 // Auto-detects MJPEG vs HLS by Content-Type header
 
@@ -251,8 +171,8 @@ static NSString *hook_NSStringFromClass(Class cls) {
     config.timeoutIntervalForResource = 0;
     config.HTTPMaximumConnectionsPerHost = 1;
 
-    self.session    = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
-    self.imageData  = [NSMutableData data];
+    self.session     = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+    self.imageData   = [NSMutableData data];
     self.parseCursor = 0;
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:self.streamURL];
