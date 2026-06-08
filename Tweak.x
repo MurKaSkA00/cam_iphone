@@ -1,4 +1,4 @@
-// Tweak.x - MediaPlaybackUtils v1.4.9
+// Tweak.x - MediaPlaybackUtils v1.4.6
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -19,8 +19,8 @@ static CIContext *_v_ciContext = nil;
 static NSMutableSet *_overlayLayers = nil;
 static BOOL _overlayTimerStarted = NO;
 
-static const void *kOverlayTimerKey = &kOverlayTimerKey;
-static const void *kOverlayLayerKey = &kOverlayLayerKey;
+const void *kOverlayTimerKey = &kOverlayTimerKey;
+const void *kOverlayLayerKey = &kOverlayLayerKey;
 
 static void _v_loadPrefs(void) {
     CFPreferencesAppSynchronize(MPU_PREFS_ID);
@@ -200,8 +200,49 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
                     origIMP = class_replaceMethod(cls, sel, newIMP, types);
                 }
                 [swizzledClassNames addObject:clsName];
-                NSLog(@"[MPU] Swizzled: %@", clsName);
+                NSLog(@"[MPU] Swizzled delegate: %@", clsName);
             }
+        }
+    }
+    %orig;
+}
+
+%end
+
+%hook AVSampleBufferDisplayLayer
+
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!_enabled) { %orig; return; }
+    _v_init();
+    CMSampleBufferRef replacement = _v_makeReplacementSampleBuffer(sampleBuffer);
+    if (replacement) {
+        %orig(replacement);
+        CFRelease(replacement);
+    } else {
+        %orig;
+    }
+}
+
+%end
+
+%hook AVCapturePhotoOutput
+
+- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings
+                        delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
+    if (!_enabled || !delegate) { %orig; return; }
+    _v_init();
+
+    static NSMutableSet *swizzledPhotoDelegates = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ swizzledPhotoDelegates = [NSMutableSet new]; });
+
+    Class cls = object_getClass(delegate);
+    NSString *clsName = NSStringFromClass(cls);
+
+    @synchronized(swizzledPhotoDelegates) {
+        if (![swizzledPhotoDelegates containsObject:clsName]) {
+            [swizzledPhotoDelegates addObject:clsName];
+            NSLog(@"[MPU] Photo delegate registered: %@", clsName);
         }
     }
     %orig;
@@ -285,6 +326,10 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
     if (_enabled) { _v_init(); }
     %orig;
 }
+- (void)addOutput:(AVCaptureOutput *)output {
+    if (_enabled) { _v_init(); }
+    %orig;
+}
 %end
 
 %hook AVCaptureDevice
@@ -325,8 +370,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
         _v_lock = [NSObject new];
         _overlayLayers = [NSMutableSet new];
-        _v_ciContext = [CIContext contextWithOptions:
-            @{ kCIContextUseSoftwareRenderer: @NO }];
+        _v_ciContext = [CIContext contextWithOptions:nil];
 
         _v_loadPrefs();
 
@@ -337,9 +381,10 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
         if (_enabled) {
-            NSLog(@"[MPU] v1.4.5 enabled: %@", bid);
+            NSLog(@"[MPU] v1.4.6 enabled: %@", bid);
             %init;
             dispatch_async(dispatch_get_main_queue(), ^{
+                _v_init();
                 _v_startOverlayTimer();
             });
         }
