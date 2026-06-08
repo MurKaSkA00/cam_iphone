@@ -1,4 +1,4 @@
-// Tweak.x - MediaPlaybackUtils v1.4.6
+// Tweak.x - MediaPlaybackUtils v1.4.7
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -7,6 +7,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import "_MPUMediaBufferAdapter.h"
+#import "FrameProcessor.h"
 
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
@@ -15,12 +16,18 @@ static NSString *_url = @"http://192.168.1.44:8888/live";
 static _MPUMediaBufferAdapter *_reader = nil;
 static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
+static id _v_initLock = nil;
+static BOOL _v_initialized = NO;
 static CIContext *_v_ciContext = nil;
 static NSMutableSet *_overlayLayers = nil;
 static BOOL _overlayTimerStarted = NO;
 
 const void *kOverlayTimerKey = &kOverlayTimerKey;
 const void *kOverlayLayerKey = &kOverlayLayerKey;
+
+static void _v_init(void);
+static void _v_restart(void);
+static void _v_setOverlaysHidden(BOOL hidden);
 
 static void _v_loadPrefs(void) {
     CFPreferencesAppSynchronize(MPU_PREFS_ID);
@@ -43,12 +50,25 @@ static void _v_loadPrefs(void) {
 static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
                              CFStringRef name, const void *object,
                              CFDictionaryRef userInfo) {
+    BOOL     prevEnabled = _enabled;
+    NSString *prevURL    = [_url copy];
+
     _v_loadPrefs();
+
     NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
+
+    BOOL urlChanged     = ![prevURL isEqualToString:_url];
+    BOOL enabledChanged = (prevEnabled != _enabled);
+
+    if (urlChanged || enabledChanged) {
+        _v_restart();
+        _v_setOverlaysHidden(!_enabled);
+    }
 }
 
 static void _v_updateOverlays(void) {
     if (!_overlayLayers || !_v_lock) return;
+    if (!_enabled) return;
 
     CVPixelBufferRef buf = NULL;
     @synchronized(_v_lock) {
@@ -107,25 +127,69 @@ static void _v_startOverlayTimer(void) {
     NSLog(@"[MPU] Overlay timer started at 30fps");
 }
 
+static void _v_setOverlaysHidden(BOOL hidden) {
+    if (!_overlayLayers) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        @synchronized(_overlayLayers) {
+            for (CALayer *overlay in _overlayLayers) {
+                overlay.hidden = hidden;
+            }
+        }
+        [CATransaction commit];
+    });
+}
+
 static void _v_init(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
+    @synchronized(_v_initLock) {
+        if (_v_initialized) return;
+        if (!_enabled) return;
+
         NSURL *u = [NSURL URLWithString:_url];
         if (!u) {
             NSLog(@"[MPU] Invalid URL: %@", _url);
             return;
         }
+        _v_initialized = YES;
+
         _reader = [[_MPUMediaBufferAdapter alloc] initWithURL:u];
         _reader.pixelBufferCallback = ^(CVPixelBufferRef buffer) {
             if (!buffer) return;
+            // Гарантируем BGRA + IOSurface — иначе HLS-кадры могут не
+            // подойти ни для CALayer.contents, ни для CMSampleBuffer.
+            CVPixelBufferRef processed =
+                [[_MPUFrameProcessor sharedProcessor] processBuffer:buffer];
+            if (!processed) return;
             @synchronized(_v_lock) {
                 if (_lastBuffer) CVPixelBufferRelease(_lastBuffer);
-                _lastBuffer = CVPixelBufferRetain(buffer);
+                _lastBuffer = processed; // уже retained процессором
             }
         };
         [_reader startStreaming];
         NSLog(@"[MPU] Stream initialized: %@", _url);
-    });
+    }
+}
+
+static void _v_restart(void) {
+    @synchronized(_v_initLock) {
+        if (_reader) {
+            [_reader stopStreaming];
+            _reader = nil;
+        }
+        @synchronized(_v_lock) {
+            if (_lastBuffer) {
+                CVPixelBufferRelease(_lastBuffer);
+                _lastBuffer = NULL;
+            }
+        }
+        _v_initialized = NO;
+    }
+    if (_enabled) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            _v_init();
+        });
+    }
 }
 
 static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef original) {
@@ -144,6 +208,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
     CMSampleTimingInfo timing;
     if (original && CMSampleBufferGetSampleTimingInfo(original, 0, &timing) == noErr) {
+        // используем тайминг оригинального буфера
     } else {
         timing.duration = CMTimeMake(1, 30);
         timing.presentationTimeStamp =
@@ -281,10 +346,16 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 - (void)layoutSublayers {
     %orig;
-    if (!_enabled) return;
-    _v_init();
 
     CALayer *overlay = objc_getAssociatedObject(self, kOverlayLayerKey);
+
+    if (!_enabled) {
+        if (overlay) overlay.hidden = YES;
+        return;
+    }
+
+    _v_init();
+
     if (!overlay) {
         overlay = [CALayer layer];
         overlay.contentsGravity = kCAGravityResizeAspectFill;
@@ -294,11 +365,12 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         [self addSublayer:overlay];
         objc_setAssociatedObject(self, kOverlayLayerKey, overlay,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSUInteger count = 0;
         @synchronized(_overlayLayers) {
             [_overlayLayers addObject:overlay];
+            count = _overlayLayers.count;
         }
-        NSLog(@"[MPU] Overlay added, total: %lu",
-              (unsigned long)_overlayLayers.count);
+        NSLog(@"[MPU] Overlay added, total: %lu", (unsigned long)count);
     }
 
     [CATransaction begin];
@@ -368,9 +440,10 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         if ([path hasPrefix:@"/System/Library/PrivateFrameworks/"]) return;
         if ([path hasPrefix:@"/System/Library/Frameworks/"]) return;
 
-        _v_lock = [NSObject new];
+        _v_lock        = [NSObject new];
+        _v_initLock    = [NSObject new];
         _overlayLayers = [NSMutableSet new];
-        _v_ciContext = [CIContext contextWithOptions:nil];
+        _v_ciContext   = [CIContext contextWithOptions:nil];
 
         _v_loadPrefs();
 
@@ -380,11 +453,19 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
             CFSTR("com.proximacore.mediaplaybackutils/prefsChanged"),
             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
+        // %init теперь безусловный — хуки активны всегда,
+        // а _enabled проверяется уже внутри них.
+        NSLog(@"[MPU] v1.4.7 loaded (enabled=%d): %@", _enabled, bid);
+        %init;
+
         if (_enabled) {
-            NSLog(@"[MPU] v1.4.6 enabled: %@", bid);
-            %init;
             dispatch_async(dispatch_get_main_queue(), ^{
                 _v_init();
+                _v_startOverlayTimer();
+            });
+        } else {
+            // даже если выключено — поднимем таймер, он сам проверит _enabled
+            dispatch_async(dispatch_get_main_queue(), ^{
                 _v_startOverlayTimer();
             });
         }
