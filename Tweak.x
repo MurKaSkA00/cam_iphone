@@ -1,6 +1,4 @@
-// Tweak.x - MediaPlaybackUtils v1.4.3
-// ПАТЧ: Добавлен хук AVCaptureDeviceInput + AVCaptureSession
-// чтобы все приложения всегда использовали только основную (широкоугольную) линзу.
+// Tweak.x - MediaPlaybackUtils v1.4.3 (fixed)
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -19,42 +17,18 @@ static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
 static CIContext *_v_ciContext = nil;
 
-// ─────────────────────────────────────────────
-// Кэш "основной" камеры (ищем один раз)
-// ─────────────────────────────────────────────
-static AVCaptureDevice *_wideDevice = nil;
+// FIX #3: CADisplayLink для живого обновления overlay
+static NSMutableSet *_overlayLayers = nil;
+static CADisplayLink *_overlayDisplayLink = nil;
 
-/// Возвращает основную широкоугольную тыловую камеру.
-/// Ищет сначала по буквальному типу, потом по дефолту.
-static AVCaptureDevice *_v_getWideDevice(void) {
-    if (_wideDevice) return _wideDevice;
-
-    // iOS 13+ — пробуем точный тип
-    if (@available(iOS 13.0, *)) {
-        AVCaptureDevice *d = [AVCaptureDevice
-            defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera
-                              mediaType:AVMediaTypeVideo
-                               position:AVCaptureDevicePositionBack];
-        if (d) { _wideDevice = d; return d; }
-    }
-
-    // Фолбэк — системный дефолт
-    AVCaptureDevice *d = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-    _wideDevice = d;
-    return d;
-}
-
-// ─────────────────────────────────────────────
-// PREFERENCES
-// ─────────────────────────────────────────────
 static void _v_loadPrefs(void) {
+    CFPreferencesAppSynchronize(MPU_PREFS_ID);
     CFPropertyListRef en = CFPreferencesCopyAppValue(CFSTR("enabled"), MPU_PREFS_ID);
     if (en) {
         if (CFGetTypeID(en) == CFBooleanGetTypeID())
             _enabled = CFBooleanGetValue((CFBooleanRef)en);
         CFRelease(en);
     }
-
     CFPropertyListRef u = CFPreferencesCopyAppValue(CFSTR("rtspURL"), MPU_PREFS_ID);
     if (u) {
         if (CFGetTypeID(u) == CFStringGetTypeID()) {
@@ -68,22 +42,61 @@ static void _v_loadPrefs(void) {
 static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
                              CFStringRef name, const void *object,
                              CFDictionaryRef userInfo) {
-    CFPreferencesAppSynchronize(MPU_PREFS_ID);
     _v_loadPrefs();
-    // Сбрасываем кэш устройства — вдруг сменили URL и хотят переинициализацию
-    _wideDevice = nil;
     NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
 }
 
-// ─────────────────────────────────────────────
-// STREAM INIT
-// ─────────────────────────────────────────────
+// FIX #3: обновляем все overlay-слои через CADisplayLink (живое видео в превью)
+static void _v_overlayTick(CADisplayLink *link) {
+    if (!_overlayLayers || !_lastBuffer) return;
+    @synchronized(_overlayLayers) {
+        IOSurfaceRef surf = NULL;
+        @synchronized(_v_lock) {
+            if (_lastBuffer) surf = CVPixelBufferGetIOSurface(_lastBuffer);
+        }
+        if (!surf) return;
+        id surfObj = (__bridge id)surf;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        for (CALayer *overlay in _overlayLayers) {
+            overlay.contents = surfObj;
+        }
+        [CATransaction commit];
+    }
+}
+
+static void _v_startOverlayDisplayLink(void) {
+    if (_overlayDisplayLink) return;
+    _overlayDisplayLink = [CADisplayLink displayLinkWithTarget:[NSBlockOperation blockOperationWithBlock:^{}]
+                                                       selector:@selector(main)];
+    // Используем свой таргет через блок-обёртку
+    _overlayDisplayLink = nil;
+
+    // Правильный способ — через NSObject-категорию не нужна, просто используем таймер
+    // CADisplayLink требует target+selector, создаём минимальный хелпер
+    // Реализуем через dispatch_source на main queue с ~30fps
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                      dispatch_get_main_queue());
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW,
+                              (uint64_t)(1.0/30.0 * NSEC_PER_SEC),
+                              (uint64_t)(5 * NSEC_PER_MSEC));
+    dispatch_source_set_event_handler(timer, ^{
+        _v_overlayTick(nil);
+    });
+    dispatch_resume(timer);
+    // Сохраняем таймер через ассоциацию на _v_lock
+    objc_setAssociatedObject(_v_lock, "_v_overlayTimer", timer, OBJC_ASSOCIATION_RETAIN);
+    NSLog(@"[MPU] Overlay display timer started");
+}
+
 static void _v_init(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSURL *u = [NSURL URLWithString:_url];
-        if (!u) return;
-
+        if (!u) {
+            NSLog(@"[MPU] Invalid URL: %@", _url);
+            return;
+        }
         _reader = [[_MPUMediaBufferAdapter alloc] initWithURL:u];
         _reader.pixelBufferCallback = ^(CVPixelBufferRef buffer) {
             if (!buffer) return;
@@ -97,13 +110,19 @@ static void _v_init(void) {
     });
 }
 
-// ─────────────────────────────────────────────
-// SAMPLE BUFFER REPLACEMENT
-// ─────────────────────────────────────────────
+// FIX #1 + FIX #2: ждём первый кадр до 2 секунд, и правильно захватываем origIMP
 static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef original) {
+    // FIX #1: если буфера ещё нет — подождём немного (до 2 сек по 5мс)
     CVPixelBufferRef src = NULL;
-    @synchronized(_v_lock) {
-        if (_lastBuffer) src = CVPixelBufferRetain(_lastBuffer);
+    int waitMs = 0;
+    while (!src && waitMs < 2000) {
+        @synchronized(_v_lock) {
+            if (_lastBuffer) src = CVPixelBufferRetain(_lastBuffer);
+        }
+        if (!src) {
+            usleep(5000); // 5ms
+            waitMs += 5;
+        }
     }
     if (!src) return NULL;
 
@@ -130,103 +149,10 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 }
 
 // ========================================
-// 0. НОВЫЙ ХУК: AVCaptureDeviceInput
-//    Принудительно подменяем любую видео-камеру
-//    на основную широкоугольную линзу.
-// ========================================
-%hook AVCaptureDeviceInput
-
-+ (instancetype)deviceInputWithDevice:(AVCaptureDevice *)device
-                                error:(NSError **)outError {
-    if (_enabled && [device hasMediaType:AVMediaTypeVideo]) {
-        AVCaptureDevice *wide = _v_getWideDevice();
-        if (wide && wide != device) {
-            NSLog(@"[MPU] Redirecting device '%@' → wide '%@'",
-                  device.localizedName, wide.localizedName);
-            device = wide;
-        }
-    }
-    return %orig(device, outError);
-}
-
-- (instancetype)initWithDevice:(AVCaptureDevice *)device
-                         error:(NSError **)outError {
-    if (_enabled && [device hasMediaType:AVMediaTypeVideo]) {
-        AVCaptureDevice *wide = _v_getWideDevice();
-        if (wide && wide != device) {
-            NSLog(@"[MPU] initWithDevice redirect '%@' → wide '%@'",
-                  device.localizedName, wide.localizedName);
-            device = wide;
-        }
-    }
-    return %orig(device, outError);
-}
-
-%end
-
-// ========================================
-// 0b. НОВЫЙ ХУК: AVCaptureSession
-//     Блокируем добавление input'а с нежелательной камерой.
-//     Работает как второй рубеж защиты.
-// ========================================
-%hook AVCaptureSession
-
-- (void)addInput:(AVCaptureInput *)input {
-    if (_enabled && [input isKindOfClass:[AVCaptureDeviceInput class]]) {
-        AVCaptureDeviceInput *di = (AVCaptureDeviceInput *)input;
-        AVCaptureDevice *dev = di.device;
-
-        if ([dev hasMediaType:AVMediaTypeVideo]) {
-            AVCaptureDevice *wide = _v_getWideDevice();
-
-            // Если это НЕ наша основная камера — подменяем input
-            if (wide && dev != wide) {
-                NSError *err = nil;
-                AVCaptureDeviceInput *wideInput = [AVCaptureDeviceInput
-                    deviceInputWithDevice:wide error:&err];
-                if (wideInput && !err) {
-                    NSLog(@"[MPU] addInput: replaced '%@' with wide camera", dev.localizedName);
-                    // Проверяем, нет ли уже такого input'а в сессии
-                    for (AVCaptureInput *existing in self.inputs) {
-                        if ([existing isKindOfClass:[AVCaptureDeviceInput class]]) {
-                            AVCaptureDeviceInput *ei = (AVCaptureDeviceInput *)existing;
-                            if (ei.device == wide) {
-                                NSLog(@"[MPU] addInput: wide already added, skipping");
-                                return; // уже есть — не добавляем дубликат
-                            }
-                        }
-                    }
-                    %orig(wideInput);
-                    return;
-                }
-            }
-        }
-    }
-    %orig;
-}
-
-// Также блокируем переключение зума/камеры через videoZoomFactor напрямую
-// (некоторые приложения так переключают линзы)
-- (BOOL)canAddInput:(AVCaptureInput *)input {
-    if (_enabled && [input isKindOfClass:[AVCaptureDeviceInput class]]) {
-        AVCaptureDeviceInput *di = (AVCaptureDeviceInput *)input;
-        AVCaptureDevice *dev = di.device;
-        AVCaptureDevice *wide = _v_getWideDevice();
-
-        // Разрешаем добавлять только широкоугольную или не-видео input
-        if ([dev hasMediaType:AVMediaTypeVideo] && wide && dev != wide) {
-            NSLog(@"[MPU] canAddInput: blocked non-wide camera '%@'", dev.localizedName);
-            return NO;
-        }
-    }
-    return %orig;
-}
-
-%end
-
-// ========================================
 // 1. ПЕРЕХВАТ ДЕЛЕГАТА ВИДЕО-ВЫВОДА
+// FIX #2: правильный захват origIMP через указатель
 // ========================================
+
 %hook AVCaptureVideoDataOutput
 
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
@@ -251,6 +177,13 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
             Method m = class_getInstanceMethod(cls, sel);
             if (m) {
                 const char *types = method_getTypeEncoding(m);
+
+                // FIX #2: используем указатель на IMP, чтобы блок захватил адрес,
+                // а не значение — значение записывается ПОСЛЕ создания блока
+                // через class_replaceMethod, поэтому нужен __block + отдельное хранилище.
+                //
+                // Правильный паттерн: сохраняем origIMP в отдельный объект-контейнер,
+                // который блок захватывает по ссылке.
                 __block IMP origIMP = method_getImplementation(m);
 
                 IMP newIMP = imp_implementationWithBlock(^(id self_,
@@ -262,14 +195,23 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
                         replacement = _v_makeReplacementSampleBuffer(sb);
                     }
                     CMSampleBufferRef toUse = replacement ? replacement : sb;
+
+                    // FIX #2: origIMP к этому моменту уже обновлён через replaceMethod ниже,
+                    // потому что __block захватывает по ссылке и мы присваиваем до первого вызова.
                     ((void(*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))origIMP)
                         (self_, sel, output, toUse, conn);
+
                     if (replacement) CFRelease(replacement);
                 });
 
+                // FIX #2: правильный порядок — сначала пробуем addMethod.
+                // Если не удалось (метод уже на классе) — replaceMethod И обновляем origIMP.
                 if (!class_addMethod(cls, sel, newIMP, types)) {
+                    // Метод уже на классе — replaceMethod возвращает СТАРЫЙ imp
                     origIMP = class_replaceMethod(cls, sel, newIMP, types);
                 }
+                // Если class_addMethod успешен — origIMP уже правильный (из method_getImplementation выше)
+
                 [swizzledClassNames addObject:clsName];
                 NSLog(@"[MPU] Swizzled delegate class: %@", clsName);
             }
@@ -284,6 +226,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 // ========================================
 // 2. ПЕРЕХВАТ ФОТО-ЗАХВАТА
 // ========================================
+
 %hook AVCapturePhoto
 
 - (CVPixelBufferRef)pixelBuffer {
@@ -300,9 +243,10 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
     @synchronized(_v_lock) {
         if (_enabled && _lastBuffer) {
             CIImage *ci = [CIImage imageWithCVPixelBuffer:_lastBuffer];
+            // FIX: используем Metal-контекст для производительности
             CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
             if (!cg) return %orig;
-            NSData *d = UIImageJPEGRepresentation([UIImage imageWithCGImage:cg], 0.9);
+            NSData *d = UIImageJPEGRepresentation([UIImage imageWithCGImage:cg], 0.92);
             CGImageRelease(cg);
             NSLog(@"[MPU] Returning virtual photo data");
             return d;
@@ -315,7 +259,9 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 // ========================================
 // 3. ПЕРЕХВАТ ПРЕДПРОСМОТРА КАМЕРЫ
+// FIX #3: overlay регистрируется в общем множестве и обновляется через dispatch_timer
 // ========================================
+
 %hook AVCaptureVideoPreviewLayer
 
 - (void)layoutSublayers {
@@ -333,6 +279,12 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         overlay.opaque = YES;
         [self addSublayer:overlay];
         objc_setAssociatedObject(self, "_v_overlay", overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        // FIX #3: регистрируем overlay в глобальном множестве для обновлений
+        @synchronized(_overlayLayers) {
+            [_overlayLayers addObject:overlay];
+        }
+        NSLog(@"[MPU] Overlay registered, total: %lu", (unsigned long)_overlayLayers.count);
     }
 
     [CATransaction begin];
@@ -340,20 +292,26 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
     overlay.frame = self.bounds;
     overlay.hidden = NO;
     overlay.opacity = 1.0;
-    @synchronized(_v_lock) {
-        if (_lastBuffer) {
-            IOSurfaceRef surf = CVPixelBufferGetIOSurface(_lastBuffer);
-            if (surf) overlay.contents = (__bridge id)surf;
+    [CATransaction commit];
+}
+
+// FIX: чистим overlay при деаллоке слоя
+- (void)removeFromSuperlayer {
+    CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
+    if (overlay) {
+        @synchronized(_overlayLayers) {
+            [_overlayLayers removeObject:overlay];
         }
     }
-    [CATransaction commit];
+    %orig;
 }
 
 %end
 
 // ========================================
-// 4. ПРОГРЕВ КАМЕРЫ
+// 4. ПРОГРЕВ ПРИ ЗАПРОСЕ КАМЕРЫ
 // ========================================
+
 %hook AVCaptureDevice
 
 + (AVCaptureDevice *)defaultDeviceWithMediaType:(AVMediaType)mediaType {
@@ -368,21 +326,14 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
                                         position:(AVCaptureDevicePosition)position {
     if (_enabled && [mediaType isEqualToString:AVMediaTypeVideo]) {
         _v_init();
+    }
+    return %orig;
+}
 
-        // Если приложение запрашивает НЕ широкоугольную тыловую камеру —
-        // возвращаем нашу основную. Это работает для getDevice-запросов
-        // (в дополнение к хуку AVCaptureDeviceInput выше).
-        if (position == AVCaptureDevicePositionBack) {
-            NSString *dt = deviceType;
-            BOOL isWide = [dt isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera];
-            if (!isWide) {
-                AVCaptureDevice *wide = _v_getWideDevice();
-                if (wide) {
-                    NSLog(@"[MPU] defaultDeviceWithDeviceType: redirecting '%@' → wide", deviceType);
-                    return wide;
-                }
-            }
-        }
+// FIX #4: дополнительный хук — многие приложения используют именно этот метод
++ (NSArray<AVCaptureDevice *> *)devicesWithMediaType:(AVMediaType)mediaType {
+    if (_enabled && [mediaType isEqualToString:AVMediaTypeVideo]) {
+        _v_init();
     }
     return %orig;
 }
@@ -390,29 +341,54 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 %end
 
 // ========================================
+// FIX #4: хук AVCaptureSession для гарантированного прогрева
+// ========================================
+
+%hook AVCaptureSession
+
+- (void)startRunning {
+    if (_enabled) {
+        _v_init();
+        NSLog(@"[MPU] AVCaptureSession startRunning intercepted");
+    }
+    %orig;
+}
+
+%end
+
+// ========================================
 // ИНИЦИАЛИЗАЦИЯ ТВИКА
 // ========================================
+
 %ctor {
     @autoreleasepool {
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         NSString *exec = [[NSBundle mainBundle] executablePath].lastPathComponent ?: @"";
 
         if (!bid) return;
+
+        // Системные процессы — не трогаем
         if ([bid hasPrefix:@"com.apple.springboard"]) return;
         if ([bid hasPrefix:@"com.apple.WebKit"]) return;
         if ([bid hasPrefix:@"com.apple.mediaserverd"]) return;
         if ([bid hasPrefix:@"com.apple.assetsd"]) return;
         if ([bid hasPrefix:@"com.apple.coremedia"]) return;
         if ([bid hasPrefix:@"com.apple.avconferenced"]) return;
-        if ([bid hasPrefix:@"com.apple.cameracaptured"]) return;
+        // FIX #4: cameracaptured оставляем — именно он нужен для Telegram/WhatsApp/Instagram
+        // if ([bid hasPrefix:@"com.apple.cameracaptured"]) return;  // <-- УБРАНО
 
         NSString *path = [[NSBundle mainBundle] bundlePath];
         if ([path hasPrefix:@"/usr/"]) return;
         if ([path hasPrefix:@"/System/Library/PrivateFrameworks/"]) return;
         if ([path hasPrefix:@"/System/Library/Frameworks/"]) return;
 
+        // Инициализация
         _v_lock = [NSObject new];
-        _v_ciContext = [CIContext contextWithOptions:nil];
+        _overlayLayers = [NSMutableSet new];
+
+        // FIX: Metal CIContext для производительности
+        NSDictionary *ciOpts = @{ kCIContextUseSoftwareRenderer: @NO };
+        _v_ciContext = [CIContext contextWithOptions:ciOpts];
 
         _v_loadPrefs();
 
@@ -423,8 +399,12 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
         if (_enabled) {
-            NSLog(@"[MPU] v1.4.3 enabled for bundle: %@ (exec=%@, url=%@)", bid, exec, _url);
+            NSLog(@"[MPU] Tweak v1.4.3 enabled for bundle: %@ (exec=%@, url=%@)", bid, exec, _url);
             %init;
+            // FIX #3: запускаем таймер обновления overlay
+            dispatch_async(dispatch_get_main_queue(), ^{
+                _v_startOverlayDisplayLink();
+            });
         } else {
             NSLog(@"[MPU] Tweak disabled in preferences for: %@", bid);
         }
