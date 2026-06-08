@@ -1,4 +1,4 @@
-// MediaBufferAdapter.m - MediaPlaybackUtils v1.4.6
+// MediaBufferAdapter.m - MediaPlaybackUtils v1.4.7
 // Auto-detects MJPEG vs HLS by Content-Type header
 
 #import "_MPUMediaBufferAdapter.h"
@@ -9,19 +9,19 @@
 #import <MobileCoreServices/MobileCoreServices.h>
 
 @interface _MPUMediaBufferAdapter ()
-@property (nonatomic, strong) NSURLSession          *session;
-@property (nonatomic, strong) NSURLSessionDataTask  *task;
-@property (nonatomic, strong) NSMutableData         *imageData;
-@property (nonatomic, assign) NSUInteger             parseCursor;
-@property (nonatomic, assign) BOOL                   isRunning;
-@property (nonatomic, assign) BOOL                   reconnectScheduled;
-@property (nonatomic, strong) AVPlayer               *hlsPlayer;
-@property (nonatomic, strong) AVPlayerItem           *hlsPlayerItem;
+@property (nonatomic, strong) NSURLSession           *session;
+@property (nonatomic, strong) NSURLSessionDataTask   *task;
+@property (nonatomic, strong) NSMutableData          *imageData;
+@property (nonatomic, assign) NSUInteger              parseCursor;
+@property (nonatomic, assign) BOOL                    isRunning;
+@property (nonatomic, assign) BOOL                    reconnectScheduled;
+@property (nonatomic, strong) AVPlayer                *hlsPlayer;
+@property (nonatomic, strong) AVPlayerItem            *hlsPlayerItem;
 @property (nonatomic, strong) AVPlayerItemVideoOutput *videoOutput;
-@property (nonatomic, strong) CADisplayLink          *displayLink;
-@property (nonatomic, assign) BOOL                   isHLS;
-@property (nonatomic, strong) CIContext              *ciContext;
-@property (nonatomic, assign, readwrite) BOOL         isConnecting;
+@property (nonatomic, strong) CADisplayLink           *displayLink;
+@property (nonatomic, assign) BOOL                    isHLS;
+@property (nonatomic, strong) CIContext               *ciContext;
+@property (nonatomic, assign, readwrite) BOOL          isConnecting;
 @end
 
 @implementation _MPUMediaBufferAdapter
@@ -236,7 +236,7 @@ didReceiveResponse:(NSURLResponse *)response
     NSDictionary *opts = @{
         (id)kCVPixelBufferCGImageCompatibilityKey:         @YES,
         (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
-        (id)kCVPixelBufferIOSurfacePropertiesKey:           @{}
+        (id)kCVPixelBufferIOSurfacePropertiesKey:          @{}
     };
 
     CVPixelBufferRef pb = NULL;
