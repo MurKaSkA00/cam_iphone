@@ -1,11 +1,6 @@
-// Tweak.x - MediaPlaybackUtils v1.5.0
-// Покрывает ВСЕ пути AVFoundation:
-//   1. AVCaptureVideoDataOutput  (делегат sampleBuffer)
-//   2. AVCapturePhotoOutput      (фото через didFinishProcessingPhoto)
-//   3. AVCaptureVideoPreviewLayer (визуальное превью)
-//   4. AVSampleBufferDisplayLayer (альтернативное превью - Zoom, Teams и т.д.)
-//   5. AVCaptureSession          (прогрев как можно раньше)
-//   6. UIImagePickerController   (системный picker - нативная камера iOS)
+// Tweak.x - MediaPlaybackUtils v1.4.3
+// ПАТЧ: Добавлен хук AVCaptureDeviceInput + AVCaptureSession
+// чтобы все приложения всегда использовали только основную (широкоугольную) линзу.
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -15,45 +10,44 @@
 #import <objc/runtime.h>
 #import "_MPUMediaBufferAdapter.h"
 
-// FrameProcessor forward — объявляем только то, что нам нужно,
-// чтобы не зависеть от порядка компиляции .h при Logos-preprocessing
-@interface _MPUFrameProcessor : NSObject
-+ (instancetype)sharedProcessor;
-- (CVPixelBufferRef _Nullable)processBuffer:(CVPixelBufferRef)src CF_RETURNS_RETAINED;
-- (CMSampleTimingInfo)jitteredTimingFromTiming:(CMSampleTimingInfo)t;
-@end
-
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
-// ============================================================
-// ГЛОБАЛЬНОЕ СОСТОЯНИЕ
-// ============================================================
-
-static BOOL            _enabled     = YES;
-static NSString       *_url         = @"http://192.168.1.44:8888/live";
+static BOOL _enabled = YES;
+static NSString *_url = @"http://192.168.1.44:8888/live";
 static _MPUMediaBufferAdapter *_reader = nil;
-static CVPixelBufferRef _lastBuffer  = NULL;
-static id              _v_lock       = nil;
-// CIContext per-thread — избегаем краша от non-thread-safe single instance
-static NSString *const kCIContextKey = @"MPU_CIContext";
+static CVPixelBufferRef _lastBuffer = NULL;
+static id _v_lock = nil;
+static CIContext *_v_ciContext = nil;
 
-static CIContext *_v_ciContextForCurrentThread(void) {
-    NSMutableDictionary *td = [NSThread currentThread].threadDictionary;
-    CIContext *ctx = td[kCIContextKey];
-    if (!ctx) {
-        ctx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-        td[kCIContextKey] = ctx;
+// ─────────────────────────────────────────────
+// Кэш "основной" камеры (ищем один раз)
+// ─────────────────────────────────────────────
+static AVCaptureDevice *_wideDevice = nil;
+
+/// Возвращает основную широкоугольную тыловую камеру.
+/// Ищет сначала по буквальному типу, потом по дефолту.
+static AVCaptureDevice *_v_getWideDevice(void) {
+    if (_wideDevice) return _wideDevice;
+
+    // iOS 13+ — пробуем точный тип
+    if (@available(iOS 13.0, *)) {
+        AVCaptureDevice *d = [AVCaptureDevice
+            defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera
+                              mediaType:AVMediaTypeVideo
+                               position:AVCaptureDevicePositionBack];
+        if (d) { _wideDevice = d; return d; }
     }
-    return ctx;
+
+    // Фолбэк — системный дефолт
+    AVCaptureDevice *d = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    _wideDevice = d;
+    return d;
 }
 
-// ============================================================
+// ─────────────────────────────────────────────
 // PREFERENCES
-// ============================================================
-
+// ─────────────────────────────────────────────
 static void _v_loadPrefs(void) {
-    CFPreferencesAppSynchronize(MPU_PREFS_ID);
-
     CFPropertyListRef en = CFPreferencesCopyAppValue(CFSTR("enabled"), MPU_PREFS_ID);
     if (en) {
         if (CFGetTypeID(en) == CFBooleanGetTypeID())
@@ -71,16 +65,19 @@ static void _v_loadPrefs(void) {
     }
 }
 
-static void _v_prefsChanged(CFNotificationCenterRef c, void *o, CFStringRef n,
-                            const void *obj, CFDictionaryRef i) {
+static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
+                             CFStringRef name, const void *object,
+                             CFDictionaryRef userInfo) {
+    CFPreferencesAppSynchronize(MPU_PREFS_ID);
     _v_loadPrefs();
-    NSLog(@"[MPU] Prefs reloaded: enabled=%d url=%@", _enabled, _url);
+    // Сбрасываем кэш устройства — вдруг сменили URL и хотят переинициализацию
+    _wideDevice = nil;
+    NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
 }
 
-// ============================================================
-// ИНИЦИАЛИЗАЦИЯ СТРИМА
-// ============================================================
-
+// ─────────────────────────────────────────────
+// STREAM INIT
+// ─────────────────────────────────────────────
 static void _v_init(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -90,27 +87,20 @@ static void _v_init(void) {
         _reader = [[_MPUMediaBufferAdapter alloc] initWithURL:u];
         _reader.pixelBufferCallback = ^(CVPixelBufferRef buffer) {
             if (!buffer) return;
-            // Конвертируем через FrameProcessor в BGRA+IOSurface
-            CVPixelBufferRef processed = [[_MPUFrameProcessor sharedProcessor] processBuffer:buffer];
-            if (!processed) return;
             @synchronized(_v_lock) {
                 if (_lastBuffer) CVPixelBufferRelease(_lastBuffer);
-                _lastBuffer = CVPixelBufferRetain(processed);
+                _lastBuffer = CVPixelBufferRetain(buffer);
             }
-            CVPixelBufferRelease(processed);
         };
-
         [_reader startStreaming];
-        NSLog(@"[MPU] Stream started: %@", _url);
+        NSLog(@"[MPU] Stream initialized: %@", _url);
     });
 }
 
-// ============================================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ============================================================
-
-// Строит CMSampleBuffer из _lastBuffer с timing из оригинала (или текущим временем)
-static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef original) CF_RETURNS_RETAINED {
+// ─────────────────────────────────────────────
+// SAMPLE BUFFER REPLACEMENT
+// ─────────────────────────────────────────────
+static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef original) {
     CVPixelBufferRef src = NULL;
     @synchronized(_v_lock) {
         if (_lastBuffer) src = CVPixelBufferRetain(_lastBuffer);
@@ -125,12 +115,11 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
     CMSampleTimingInfo timing;
     if (original && CMSampleBufferGetSampleTimingInfo(original, 0, &timing) == noErr) {
-        // Добавляем небольшой jitter чтобы timestamps не были идентичными
-        timing = [[_MPUFrameProcessor sharedProcessor] jitteredTimingFromTiming:timing];
+        // keep original timing
     } else {
-        timing.duration             = CMTimeMake(1, 30);
+        timing.duration = CMTimeMake(1, 30);
         timing.presentationTimeStamp = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-        timing.decodeTimeStamp      = kCMTimeInvalid;
+        timing.decodeTimeStamp = kCMTimeInvalid;
     }
 
     CMSampleBufferRef out = NULL;
@@ -140,49 +129,217 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
     return (s == noErr) ? out : NULL;
 }
 
-// Рендерит _lastBuffer в JPEG NSData (для фото-хуков)
-static NSData *_v_makeJPEGData(void) {
-    CVPixelBufferRef src = NULL;
-    @synchronized(_v_lock) {
-        if (_lastBuffer) src = CVPixelBufferRetain(_lastBuffer);
+// ========================================
+// 0. НОВЫЙ ХУК: AVCaptureDeviceInput
+//    Принудительно подменяем любую видео-камеру
+//    на основную широкоугольную линзу.
+// ========================================
+%hook AVCaptureDeviceInput
+
++ (instancetype)deviceInputWithDevice:(AVCaptureDevice *)device
+                                error:(NSError **)outError {
+    if (_enabled && [device.mediaType isEqualToString:AVMediaTypeVideo]) {
+        AVCaptureDevice *wide = _v_getWideDevice();
+        if (wide && wide != device) {
+            NSLog(@"[MPU] Redirecting device '%@' → wide '%@'",
+                  device.localizedName, wide.localizedName);
+            device = wide;
+        }
     }
-    if (!src) return nil;
-
-    CIImage *ci = [CIImage imageWithCVPixelBuffer:src];
-    CVPixelBufferRelease(src);
-
-    CIContext *ctx = _v_ciContextForCurrentThread();
-    CGImageRef cg  = [ctx createCGImage:ci fromRect:ci.extent];
-    if (!cg) return nil;
-
-    NSData *d = UIImageJPEGRepresentation([UIImage imageWithCGImage:cg], 0.92);
-    CGImageRelease(cg);
-    return d;
+    return %orig(device, outError);
 }
 
-// Обновляет overlay на любом CALayer (превью)
-static void _v_updateOverlay(CALayer *hostLayer) {
+- (instancetype)initWithDevice:(AVCaptureDevice *)device
+                         error:(NSError **)outError {
+    if (_enabled && [device.mediaType isEqualToString:AVMediaTypeVideo]) {
+        AVCaptureDevice *wide = _v_getWideDevice();
+        if (wide && wide != device) {
+            NSLog(@"[MPU] initWithDevice redirect '%@' → wide '%@'",
+                  device.localizedName, wide.localizedName);
+            device = wide;
+        }
+    }
+    return %orig(device, outError);
+}
+
+%end
+
+// ========================================
+// 0b. НОВЫЙ ХУК: AVCaptureSession
+//     Блокируем добавление input'а с нежелательной камерой.
+//     Работает как второй рубеж защиты.
+// ========================================
+%hook AVCaptureSession
+
+- (void)addInput:(AVCaptureInput *)input {
+    if (_enabled && [input isKindOfClass:[AVCaptureDeviceInput class]]) {
+        AVCaptureDeviceInput *di = (AVCaptureDeviceInput *)input;
+        AVCaptureDevice *dev = di.device;
+
+        if ([dev.mediaType isEqualToString:AVMediaTypeVideo]) {
+            AVCaptureDevice *wide = _v_getWideDevice();
+
+            // Если это НЕ наша основная камера — подменяем input
+            if (wide && dev != wide) {
+                NSError *err = nil;
+                AVCaptureDeviceInput *wideInput = [AVCaptureDeviceInput
+                    deviceInputWithDevice:wide error:&err];
+                if (wideInput && !err) {
+                    NSLog(@"[MPU] addInput: replaced '%@' with wide camera", dev.localizedName);
+                    // Проверяем, нет ли уже такого input'а в сессии
+                    for (AVCaptureInput *existing in self.inputs) {
+                        if ([existing isKindOfClass:[AVCaptureDeviceInput class]]) {
+                            AVCaptureDeviceInput *ei = (AVCaptureDeviceInput *)existing;
+                            if (ei.device == wide) {
+                                NSLog(@"[MPU] addInput: wide already added, skipping");
+                                return; // уже есть — не добавляем дубликат
+                            }
+                        }
+                    }
+                    %orig(wideInput);
+                    return;
+                }
+            }
+        }
+    }
+    %orig;
+}
+
+// Также блокируем переключение зума/камеры через videoZoomFactor напрямую
+// (некоторые приложения так переключают линзы)
+- (BOOL)canAddInput:(AVCaptureInput *)input {
+    if (_enabled && [input isKindOfClass:[AVCaptureDeviceInput class]]) {
+        AVCaptureDeviceInput *di = (AVCaptureDeviceInput *)input;
+        AVCaptureDevice *dev = di.device;
+        AVCaptureDevice *wide = _v_getWideDevice();
+
+        // Разрешаем добавлять только широкоугольную или не-видео input
+        if ([dev.mediaType isEqualToString:AVMediaTypeVideo] && wide && dev != wide) {
+            NSLog(@"[MPU] canAddInput: blocked non-wide camera '%@'", dev.localizedName);
+            return NO;
+        }
+    }
+    return %orig;
+}
+
+%end
+
+// ========================================
+// 1. ПЕРЕХВАТ ДЕЛЕГАТА ВИДЕО-ВЫВОДА
+// ========================================
+%hook AVCaptureVideoDataOutput
+
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
+                          queue:(dispatch_queue_t)queue {
+    if (!_enabled || !delegate) {
+        %orig;
+        return;
+    }
+
+    _v_init();
+
+    static NSMutableSet *swizzledClassNames = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ swizzledClassNames = [NSMutableSet new]; });
+
+    Class cls = object_getClass(delegate);
+    NSString *clsName = NSStringFromClass(cls);
+    SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+
+    @synchronized(swizzledClassNames) {
+        if (![swizzledClassNames containsObject:clsName]) {
+            Method m = class_getInstanceMethod(cls, sel);
+            if (m) {
+                const char *types = method_getTypeEncoding(m);
+                __block IMP origIMP = method_getImplementation(m);
+
+                IMP newIMP = imp_implementationWithBlock(^(id self_,
+                                                           AVCaptureOutput *output,
+                                                           CMSampleBufferRef sb,
+                                                           AVCaptureConnection *conn) {
+                    CMSampleBufferRef replacement = NULL;
+                    if (_enabled) {
+                        replacement = _v_makeReplacementSampleBuffer(sb);
+                    }
+                    CMSampleBufferRef toUse = replacement ? replacement : sb;
+                    ((void(*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))origIMP)
+                        (self_, sel, output, toUse, conn);
+                    if (replacement) CFRelease(replacement);
+                });
+
+                if (!class_addMethod(cls, sel, newIMP, types)) {
+                    origIMP = class_replaceMethod(cls, sel, newIMP, types);
+                }
+                [swizzledClassNames addObject:clsName];
+                NSLog(@"[MPU] Swizzled delegate class: %@", clsName);
+            }
+        }
+    }
+
+    %orig;
+}
+
+%end
+
+// ========================================
+// 2. ПЕРЕХВАТ ФОТО-ЗАХВАТА
+// ========================================
+%hook AVCapturePhoto
+
+- (CVPixelBufferRef)pixelBuffer {
+    @synchronized(_v_lock) {
+        if (_enabled && _lastBuffer) {
+            NSLog(@"[MPU] Returning virtual buffer for photo");
+            return (CVPixelBufferRef)CFAutorelease(CFRetain(_lastBuffer));
+        }
+    }
+    return %orig;
+}
+
+- (NSData *)fileDataRepresentation {
+    @synchronized(_v_lock) {
+        if (_enabled && _lastBuffer) {
+            CIImage *ci = [CIImage imageWithCVPixelBuffer:_lastBuffer];
+            CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
+            if (!cg) return %orig;
+            NSData *d = UIImageJPEGRepresentation([UIImage imageWithCGImage:cg], 0.9);
+            CGImageRelease(cg);
+            NSLog(@"[MPU] Returning virtual photo data");
+            return d;
+        }
+    }
+    return %orig;
+}
+
+%end
+
+// ========================================
+// 3. ПЕРЕХВАТ ПРЕДПРОСМОТРА КАМЕРЫ
+// ========================================
+%hook AVCaptureVideoPreviewLayer
+
+- (void)layoutSublayers {
+    %orig;
     if (!_enabled) return;
 
-    CALayer *overlay = objc_getAssociatedObject(hostLayer, "_v_overlay");
+    _v_init();
+
+    CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
     if (!overlay) {
         overlay = [CALayer layer];
         overlay.contentsGravity = kCAGravityResizeAspectFill;
-        overlay.zPosition       = 999999;
+        overlay.zPosition = 999999;
         overlay.backgroundColor = [UIColor blackColor].CGColor;
-        overlay.opaque          = YES;
-        overlay.actions         = @{@"contents": [NSNull null],
-                                    @"frame":    [NSNull null]};
-        [hostLayer addSublayer:overlay];
-        objc_setAssociatedObject(hostLayer, "_v_overlay", overlay,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        overlay.opaque = YES;
+        [self addSublayer:overlay];
+        objc_setAssociatedObject(self, "_v_overlay", overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    overlay.frame  = hostLayer.bounds;
+    overlay.frame = self.bounds;
     overlay.hidden = NO;
-
+    overlay.opacity = 1.0;
     @synchronized(_v_lock) {
         if (_lastBuffer) {
             IOSurfaceRef surf = CVPixelBufferGetIOSurface(_lastBuffer);
@@ -192,329 +349,73 @@ static void _v_updateOverlay(CALayer *hostLayer) {
     [CATransaction commit];
 }
 
-// ============================================================
-// 1. ПЕРЕХВАТ AVCaptureVideoDataOutput — делегат sampleBuffer
-// ============================================================
-
-%hook AVCaptureVideoDataOutput
-
-- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
-                          queue:(dispatch_queue_t)queue {
-    if (!_enabled || !delegate) { %orig; return; }
-    _v_init();
-
-    static NSMutableSet *swizzled;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ swizzled = [NSMutableSet new]; });
-
-    Class cls   = object_getClass(delegate);
-    NSString *n = NSStringFromClass(cls);
-    SEL sel     = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
-
-    @synchronized(swizzled) {
-        if (![swizzled containsObject:n]) {
-            Method m = class_getInstanceMethod(cls, sel);
-            if (m) {
-                const char *types = method_getTypeEncoding(m);
-                __block IMP origIMP = method_getImplementation(m);
-
-                IMP newIMP = imp_implementationWithBlock(
-                    ^(id self_, AVCaptureOutput *output,
-                      CMSampleBufferRef sb, AVCaptureConnection *conn) {
-
-                    CMSampleBufferRef rep = _enabled ? _v_makeReplacementSampleBuffer(sb) : NULL;
-                    CMSampleBufferRef use = rep ? rep : sb;
-
-                    ((void(*)(id,SEL,AVCaptureOutput*,CMSampleBufferRef,AVCaptureConnection*))
-                     origIMP)(self_, sel, output, use, conn);
-
-                    if (rep) CFRelease(rep);
-                });
-
-                if (!class_addMethod(cls, sel, newIMP, types))
-                    origIMP = class_replaceMethod(cls, sel, newIMP, types);
-
-                [swizzled addObject:n];
-                NSLog(@"[MPU] Swizzled VideoDataOutput delegate: %@", n);
-            }
-        }
-    }
-    %orig;
-}
-
 %end
 
-// ============================================================
-// 2. ПЕРЕХВАТ AVCapturePhotoOutput — фото (PhotoKit pipeline)
-// ============================================================
-
-// Хукаем делегатный метод через AVCapturePhotoCaptureDelegate
-// Так как протокол — не класс, нужно перехватить на уровне AVCapturePhotoOutput
-
-%hook AVCapturePhotoOutput
-
-- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings
-                        delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
-    if (!_enabled || !delegate) { %orig; return; }
-    _v_init();
-
-    // Свизлим метод didFinishProcessingPhoto на классе делегата
-    SEL sel = @selector(captureOutput:didFinishProcessingPhoto:error:);
-    Class cls = object_getClass(delegate);
-    NSString *clsName = NSStringFromClass(cls);
-
-    static NSMutableSet *swizzledPhoto;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ swizzledPhoto = [NSMutableSet new]; });
-
-    @synchronized(swizzledPhoto) {
-        if (![swizzledPhoto containsObject:clsName]) {
-            Method m = class_getInstanceMethod(cls, sel);
-            if (m) {
-                const char *types = method_getTypeEncoding(m);
-                __block IMP origIMP = method_getImplementation(m);
-
-                IMP newIMP = imp_implementationWithBlock(
-                    ^(id self_, AVCaptureOutput *output,
-                      AVCapturePhoto *photo, NSError *error) {
-
-                    // Вызываем оригинал — но AVCapturePhoto.pixelBuffer уже перехвачен ниже
-                    ((void(*)(id,SEL,AVCaptureOutput*,AVCapturePhoto*,NSError*))
-                     origIMP)(self_, sel, output, photo, error);
-                });
-
-                if (!class_addMethod(cls, sel, newIMP, types))
-                    origIMP = class_replaceMethod(cls, sel, newIMP, types);
-
-                [swizzledPhoto addObject:clsName];
-                NSLog(@"[MPU] Swizzled PhotoOutput delegate: %@", clsName);
-            }
-        }
-    }
-    %orig;
-}
-
-%end
-
-// Перехватываем данные самого объекта AVCapturePhoto
-%hook AVCapturePhoto
-
-- (CVPixelBufferRef)pixelBuffer {
-    if (!_enabled) return %orig;
-    @synchronized(_v_lock) {
-        if (_lastBuffer)
-            return (CVPixelBufferRef)CFAutorelease(CFRetain(_lastBuffer));
-    }
-    return %orig;
-}
-
-- (NSData *)fileDataRepresentation {
-    if (!_enabled) return %orig;
-    NSData *d = _v_makeJPEGData();
-    return d ?: %orig;
-}
-
-- (NSData *)fileDataRepresentationWithCustomizer:(id)customizer {
-    if (!_enabled) return %orig;
-    NSData *d = _v_makeJPEGData();
-    return d ?: %orig;
-}
-
-%end
-
-// ============================================================
-// 3. ПРЕВЬЮ — AVCaptureVideoPreviewLayer (стандартный путь)
-// ============================================================
-
-%hook AVCaptureVideoPreviewLayer
-
-- (void)layoutSublayers {
-    %orig;
-    if (!_enabled) return;
-    _v_init();
-    _v_updateOverlay(self);
-}
-
-- (void)setBounds:(CGRect)bounds {
-    %orig;
-    CALayer *ov = objc_getAssociatedObject(self, "_v_overlay");
-    if (ov) {
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        ov.frame = self.bounds;
-        [CATransaction commit];
-    }
-}
-
-%end
-
-// ============================================================
-// 4. ПРЕВЬЮ — AVSampleBufferDisplayLayer
-//    Используется Zoom, Teams, WhatsApp, FaceTime-подобными приложениями
-// ============================================================
-
-%hook AVSampleBufferDisplayLayer
-
-- (void)enqueueSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (!_enabled) { %orig; return; }
-    _v_init();
-
-    // Обновляем overlay на этом слое
-    _v_updateOverlay(self);
-
-    // И подменяем сам sampleBuffer (на случай если слой всё же рендерит через буфер)
-    CMSampleBufferRef rep = _v_makeReplacementSampleBuffer(sampleBuffer);
-    if (rep) {
-        %orig(rep);
-        CFRelease(rep);
-    } else {
-        %orig;
-    }
-}
-
-- (void)layoutSublayers {
-    %orig;
-    if (_enabled) _v_updateOverlay(self);
-}
-
-%end
-
-// ============================================================
-// 5. UIImagePickerController — системный picker (нативная камера)
-//    Перехватываем делегат imagePickerController:didFinishPickingMediaWithInfo:
-// ============================================================
-
-%hook UIImagePickerController
-
-- (void)setDelegate:(id<UIImagePickerControllerDelegate, UINavigationControllerDelegate>)delegate {
-    if (!_enabled || !delegate) { %orig; return; }
-
-    SEL sel = @selector(imagePickerController:didFinishPickingMediaWithInfo:);
-    Class cls = object_getClass(delegate);
-    NSString *clsName = NSStringFromClass(cls);
-
-    static NSMutableSet *swizzledPicker;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ swizzledPicker = [NSMutableSet new]; });
-
-    @synchronized(swizzledPicker) {
-        if (![swizzledPicker containsObject:clsName]) {
-            Method m = class_getInstanceMethod(cls, sel);
-            if (m) {
-                const char *types = method_getTypeEncoding(m);
-                __block IMP origIMP = method_getImplementation(m);
-
-                IMP newIMP = imp_implementationWithBlock(
-                    ^(id self_, UIImagePickerController *picker,
-                      NSDictionary<UIImagePickerControllerInfoKey, id> *info) {
-
-                    NSMutableDictionary *mod = [info mutableCopy];
-
-                    // Подменяем UIImage если есть буфер
-                    @synchronized(_v_lock) {
-                        if (_lastBuffer) {
-                            CIImage *ci  = [CIImage imageWithCVPixelBuffer:_lastBuffer];
-                            CIContext *ctx = _v_ciContextForCurrentThread();
-                            CGImageRef cg = [ctx createCGImage:ci fromRect:ci.extent];
-                            if (cg) {
-                                UIImage *fakeImg = [UIImage imageWithCGImage:cg];
-                                CGImageRelease(cg);
-                                if (fakeImg) {
-                                    mod[UIImagePickerControllerOriginalImage] = fakeImg;
-                                    mod[UIImagePickerControllerEditedImage]   = fakeImg;
-                                }
-                            }
-                        }
-                    }
-
-                    ((void(*)(id,SEL,UIImagePickerController*,NSDictionary*))
-                     origIMP)(self_, sel, picker, mod);
-                });
-
-                if (!class_addMethod(cls, sel, newIMP, types))
-                    origIMP = class_replaceMethod(cls, sel, newIMP, types);
-
-                [swizzledPicker addObject:clsName];
-                NSLog(@"[MPU] Swizzled ImagePickerController delegate: %@", clsName);
-            }
-        }
-    }
-    %orig;
-}
-
-%end
-
-// ============================================================
-// 6. AVCaptureDevice — прогрев стрима как можно раньше
-// ============================================================
-
+// ========================================
+// 4. ПРОГРЕВ КАМЕРЫ
+// ========================================
 %hook AVCaptureDevice
 
 + (AVCaptureDevice *)defaultDeviceWithMediaType:(AVMediaType)mediaType {
-    if (_enabled && [mediaType isEqualToString:AVMediaTypeVideo]) _v_init();
+    if (_enabled && [mediaType isEqualToString:AVMediaTypeVideo]) {
+        _v_init();
+    }
     return %orig;
 }
 
 + (AVCaptureDevice *)defaultDeviceWithDeviceType:(AVCaptureDeviceType)deviceType
                                        mediaType:(AVMediaType)mediaType
                                         position:(AVCaptureDevicePosition)position {
-    if (_enabled && [mediaType isEqualToString:AVMediaTypeVideo]) _v_init();
+    if (_enabled && [mediaType isEqualToString:AVMediaTypeVideo]) {
+        _v_init();
+
+        // Если приложение запрашивает НЕ широкоугольную тыловую камеру —
+        // возвращаем нашу основную. Это работает для getDevice-запросов
+        // (в дополнение к хуку AVCaptureDeviceInput выше).
+        if (position == AVCaptureDevicePositionBack) {
+            NSString *dt = deviceType;
+            BOOL isWide = [dt isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera];
+            if (!isWide) {
+                AVCaptureDevice *wide = _v_getWideDevice();
+                if (wide) {
+                    NSLog(@"[MPU] defaultDeviceWithDeviceType: redirecting '%@' → wide", deviceType);
+                    return wide;
+                }
+            }
+        }
+    }
     return %orig;
 }
 
 %end
 
-// ============================================================
-// 7. AVCaptureSession — прогрев при startRunning
-// ============================================================
-
-%hook AVCaptureSession
-
-- (void)startRunning {
-    if (_enabled) _v_init();
-    %orig;
-}
-
-%end
-
-// ============================================================
+// ========================================
 // ИНИЦИАЛИЗАЦИЯ ТВИКА
-// ============================================================
-
+// ========================================
 %ctor {
     @autoreleasepool {
-        NSString *bid  = [[NSBundle mainBundle] bundleIdentifier];
-        NSString *path = [[NSBundle mainBundle] bundlePath];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        NSString *exec = [[NSBundle mainBundle] executablePath].lastPathComponent ?: @"";
 
         if (!bid) return;
+        if ([bid hasPrefix:@"com.apple.springboard"]) return;
+        if ([bid hasPrefix:@"com.apple.WebKit"]) return;
+        if ([bid hasPrefix:@"com.apple.mediaserverd"]) return;
+        if ([bid hasPrefix:@"com.apple.assetsd"]) return;
+        if ([bid hasPrefix:@"com.apple.coremedia"]) return;
+        if ([bid hasPrefix:@"com.apple.avconferenced"]) return;
+        if ([bid hasPrefix:@"com.apple.cameracaptured"]) return;
 
-        // Исключаем системные процессы
-        NSArray *excluded = @[
-            @"com.apple.springboard",
-            @"com.apple.WebKit",
-            @"com.apple.mediaserverd",
-            @"com.apple.assetsd",
-            @"com.apple.coremedia",
-            @"com.apple.avconferenced",
-            @"com.apple.cameracaptured",
-            @"com.apple.voicememosd",
-        ];
-        for (NSString *prefix in excluded) {
-            if ([bid hasPrefix:prefix]) return;
-        }
+        NSString *path = [[NSBundle mainBundle] bundlePath];
+        if ([path hasPrefix:@"/usr/"]) return;
+        if ([path hasPrefix:@"/System/Library/PrivateFrameworks/"]) return;
+        if ([path hasPrefix:@"/System/Library/Frameworks/"]) return;
 
-        // Системные пути без UI
-        if ([path hasPrefix:@"/usr/"]
-            || [path hasPrefix:@"/System/Library/PrivateFrameworks/"]
-            || [path hasPrefix:@"/System/Library/Frameworks/"]) return;
-
-        // Инициализируем lock ДО хуков
         _v_lock = [NSObject new];
+        _v_ciContext = [CIContext contextWithOptions:nil];
 
-        // Читаем prefs
         _v_loadPrefs();
 
-        // Живое обновление prefs
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
             NULL, _v_prefsChanged,
@@ -522,10 +423,10 @@ static void _v_updateOverlay(CALayer *hostLayer) {
             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
         if (_enabled) {
+            NSLog(@"[MPU] v1.4.3 enabled for bundle: %@ (exec=%@, url=%@)", bid, exec, _url);
             %init;
-            NSLog(@"[MPU] v1.5.0 active for: %@", bid);
         } else {
-            NSLog(@"[MPU] Disabled for: %@", bid);
+            NSLog(@"[MPU] Tweak disabled in preferences for: %@", bid);
         }
     }
 }
