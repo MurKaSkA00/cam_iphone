@@ -4,3 +4,4 @@
 *.x text eol=lf
 *.plist text eol=lf
 Makefile text eol=lf
+control text eol=lf
