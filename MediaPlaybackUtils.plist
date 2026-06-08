@@ -1,20 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Filter</key>
   <dict>
-    <key>Classes</key>
+    <key>Bundles</key>
     <array>
-      <string>AVCaptureSession</string>
-      <string>AVCaptureMultiCamSession</string>
-      <string>AVCaptureDevice</string>
-      <string>AVCaptureVideoPreviewLayer</string>
-      <string>AVCaptureVideoDataOutput</string>
-      <string>AVCapturePhoto</string>
-      <string>UIScreen</string>
-      <string>UIApplication</string>
-      <string>NSFileManager</string>
+      <string>com.apple.camera</string>
+      <string>ph.telegra.Telegraph</string>
+      <string>com.facebook.Messenger</string>
+      <string>com.atebits.Tweetie2</string>
+      <string>com.burbn.instagram</string>
+      <string>net.whatsapp.WhatsApp</string>
     </array>
   </dict>
 </dict>
