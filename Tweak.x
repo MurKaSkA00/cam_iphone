@@ -1,4 +1,7 @@
-// Tweak.x - MediaPlaybackUtils v1.4.4
+Вот полный исправленный Tweak.x — с устранённой ошибкой сборки и небольшим улучшением (правильный ключ для associated object). Скопируйте его целиком и замените им файл в репозитории.
+
+📄 Tweak.x (полный, исправленный)
+// Tweak.x - MediaPlaybackUtils v1.4.5
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -17,7 +20,11 @@ static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
 static CIContext *_v_ciContext = nil;
 static NSMutableSet *_overlayLayers = nil;
-static BOOL _overlayTimerStarted = NO; // FIX: правильный guard
+static BOOL _overlayTimerStarted = NO;
+
+// FIX: уникальные ключи для associated object (правильный паттерн)
+static const void *kOverlayTimerKey = &kOverlayTimerKey;
+static const void *kOverlayLayerKey = &kOverlayLayerKey;
 
 static void _v_loadPrefs(void) {
     CFPreferencesAppSynchronize(MPU_PREFS_ID);
@@ -44,7 +51,7 @@ static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
     NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
 }
 
-// FIX: обновляем overlay из буфера — поддержка Software buffer через CIImage
+// Обновление overlay из последнего pixel buffer
 static void _v_updateOverlays(void) {
     if (!_overlayLayers || !_v_lock) return;
 
@@ -54,7 +61,6 @@ static void _v_updateOverlays(void) {
     }
     if (!buf) return;
 
-    // Сначала пробуем IOSurface (быстро)
     IOSurfaceRef surf = CVPixelBufferGetIOSurface(buf);
 
     if (surf) {
@@ -68,8 +74,7 @@ static void _v_updateOverlays(void) {
         }
         [CATransaction commit];
     } else {
-        // FIX: fallback — конвертируем через CIImage -> CGImage
-        // Работает с software-allocated CVPixelBuffer
+        // fallback через CIImage -> CGImage для software-allocated CVPixelBuffer
         CIImage *ci = [CIImage imageWithCVPixelBuffer:buf];
         CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
         if (cg) {
@@ -89,7 +94,6 @@ static void _v_updateOverlays(void) {
 }
 
 static void _v_startOverlayTimer(void) {
-    // FIX: правильный guard — без nil-трюков
     if (_overlayTimerStarted) return;
     _overlayTimerStarted = YES;
 
@@ -103,9 +107,11 @@ static void _v_startOverlayTimer(void) {
         _v_updateOverlays();
     });
     dispatch_resume(timer);
-    // Держим таймер живым через ассоциацию
-    objc_setAssociatedObject(_v_lock, "_v_overlayTimer",
-                             (__bridge id)timer, OBJC_ASSOCIATION_RETAIN);
+
+    // FIX: dispatch_source_t уже ObjC-объект под ARC,
+    //      никакого __bridge не нужно, плюс уникальный ключ
+    objc_setAssociatedObject(_v_lock, kOverlayTimerKey,
+                             timer, OBJC_ASSOCIATION_RETAIN);
     NSLog(@"[MPU] Overlay timer started at 30fps");
 }
 
@@ -130,13 +136,12 @@ static void _v_init(void) {
     });
 }
 
-// FIX: убрана блокировка главного потока — просто возвращаем NULL если нет буфера
 static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef original) {
     CVPixelBufferRef src = NULL;
     @synchronized(_v_lock) {
         if (_lastBuffer) src = CVPixelBufferRetain(_lastBuffer);
     }
-    if (!src) return NULL; // Нет блокировки — просто пропускаем кадр
+    if (!src) return NULL;
 
     CMVideoFormatDescriptionRef fmt = NULL;
     if (CMVideoFormatDescriptionCreateForImageBuffer(
@@ -259,7 +264,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
     if (!_enabled) return;
     _v_init();
 
-    CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
+    CALayer *overlay = objc_getAssociatedObject(self, kOverlayLayerKey);
     if (!overlay) {
         overlay = [CALayer layer];
         overlay.contentsGravity = kCAGravityResizeAspectFill;
@@ -267,7 +272,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         overlay.backgroundColor = [UIColor blackColor].CGColor;
         overlay.opaque = YES;
         [self addSublayer:overlay];
-        objc_setAssociatedObject(self, "_v_overlay", overlay,
+        objc_setAssociatedObject(self, kOverlayLayerKey, overlay,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         @synchronized(_overlayLayers) {
             [_overlayLayers addObject:overlay];
@@ -285,7 +290,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 }
 
 - (void)removeFromSuperlayer {
-    CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
+    CALayer *overlay = objc_getAssociatedObject(self, kOverlayLayerKey);
     if (overlay) {
         @synchronized(_overlayLayers) {
             [_overlayLayers removeObject:overlay];
@@ -361,7 +366,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
         if (_enabled) {
-            NSLog(@"[MPU] v1.4.4 enabled: %@", bid);
+            NSLog(@"[MPU] v1.4.5 enabled: %@", bid);
             %init;
             dispatch_async(dispatch_get_main_queue(), ^{
                 _v_startOverlayTimer();
