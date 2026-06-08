@@ -1,7 +1,4 @@
-Вот полный исправленный Tweak.x — с устранённой ошибкой сборки и небольшим улучшением (правильный ключ для associated object). Скопируйте его целиком и замените им файл в репозитории.
-
-📄 Tweak.x (полный, исправленный)
-// Tweak.x - MediaPlaybackUtils v1.4.5
+// Tweak.x - MediaPlaybackUtils v1.4.9
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -22,7 +19,6 @@ static CIContext *_v_ciContext = nil;
 static NSMutableSet *_overlayLayers = nil;
 static BOOL _overlayTimerStarted = NO;
 
-// FIX: уникальные ключи для associated object (правильный паттерн)
 static const void *kOverlayTimerKey = &kOverlayTimerKey;
 static const void *kOverlayLayerKey = &kOverlayLayerKey;
 
@@ -51,7 +47,6 @@ static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
     NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
 }
 
-// Обновление overlay из последнего pixel buffer
 static void _v_updateOverlays(void) {
     if (!_overlayLayers || !_v_lock) return;
 
@@ -74,7 +69,6 @@ static void _v_updateOverlays(void) {
         }
         [CATransaction commit];
     } else {
-        // fallback через CIImage -> CGImage для software-allocated CVPixelBuffer
         CIImage *ci = [CIImage imageWithCVPixelBuffer:buf];
         CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
         if (cg) {
@@ -108,8 +102,6 @@ static void _v_startOverlayTimer(void) {
     });
     dispatch_resume(timer);
 
-    // FIX: dispatch_source_t уже ObjC-объект под ARC,
-    //      никакого __bridge не нужно, плюс уникальный ключ
     objc_setAssociatedObject(_v_lock, kOverlayTimerKey,
                              timer, OBJC_ASSOCIATION_RETAIN);
     NSLog(@"[MPU] Overlay timer started at 30fps");
@@ -152,7 +144,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
     CMSampleTimingInfo timing;
     if (original && CMSampleBufferGetSampleTimingInfo(original, 0, &timing) == noErr) {
-        // keep original timing
     } else {
         timing.duration = CMTimeMake(1, 30);
         timing.presentationTimeStamp =
@@ -167,10 +158,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
     CVPixelBufferRelease(src);
     return (s == noErr) ? out : NULL;
 }
-
-// ========================================
-// 1. ПЕРЕХВАТ ДЕЛЕГАТА ВИДЕО-ВЫВОДА
-// ========================================
 
 %hook AVCaptureVideoDataOutput
 
@@ -222,10 +209,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 %end
 
-// ========================================
-// 2. ПЕРЕХВАТ ФОТО
-// ========================================
-
 %hook AVCapturePhoto
 
 - (CVPixelBufferRef)pixelBuffer {
@@ -252,10 +235,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 }
 
 %end
-
-// ========================================
-// 3. ПЕРЕХВАТ ПРЕВЬЮ
-// ========================================
 
 %hook AVCaptureVideoPreviewLayer
 
@@ -301,10 +280,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 %end
 
-// ========================================
-// 4. ПРОГРЕВ
-// ========================================
-
 %hook AVCaptureSession
 - (void)startRunning {
     if (_enabled) { _v_init(); }
@@ -332,10 +307,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 }
 
 %end
-
-// ========================================
-// ИНИЦИАЛИЗАЦИЯ
-// ========================================
 
 %ctor {
     @autoreleasepool {
