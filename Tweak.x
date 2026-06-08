@@ -138,7 +138,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 + (instancetype)deviceInputWithDevice:(AVCaptureDevice *)device
                                 error:(NSError **)outError {
-    if (_enabled && [device.mediaType isEqualToString:AVMediaTypeVideo]) {
+    if (_enabled && [device hasMediaType:AVMediaTypeVideo]) {
         AVCaptureDevice *wide = _v_getWideDevice();
         if (wide && wide != device) {
             NSLog(@"[MPU] Redirecting device '%@' → wide '%@'",
@@ -151,7 +151,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 - (instancetype)initWithDevice:(AVCaptureDevice *)device
                          error:(NSError **)outError {
-    if (_enabled && [device.mediaType isEqualToString:AVMediaTypeVideo]) {
+    if (_enabled && [device hasMediaType:AVMediaTypeVideo]) {
         AVCaptureDevice *wide = _v_getWideDevice();
         if (wide && wide != device) {
             NSLog(@"[MPU] initWithDevice redirect '%@' → wide '%@'",
@@ -176,7 +176,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         AVCaptureDeviceInput *di = (AVCaptureDeviceInput *)input;
         AVCaptureDevice *dev = di.device;
 
-        if ([dev.mediaType isEqualToString:AVMediaTypeVideo]) {
+        if ([dev hasMediaType:AVMediaTypeVideo]) {
             AVCaptureDevice *wide = _v_getWideDevice();
 
             // Если это НЕ наша основная камера — подменяем input
@@ -214,7 +214,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         AVCaptureDevice *wide = _v_getWideDevice();
 
         // Разрешаем добавлять только широкоугольную или не-видео input
-        if ([dev.mediaType isEqualToString:AVMediaTypeVideo] && wide && dev != wide) {
+        if ([dev hasMediaType:AVMediaTypeVideo] && wide && dev != wide) {
             NSLog(@"[MPU] canAddInput: blocked non-wide camera '%@'", dev.localizedName);
             return NO;
         }
