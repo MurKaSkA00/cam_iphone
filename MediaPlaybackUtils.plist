@@ -5,15 +5,16 @@
 <dict>
   <key>Filter</key>
   <dict>
-    <key>Bundles</key>
+    <key>Classes</key>
     <array>
-      <string>com.apple.camera</string>
-      <string>ph.telegra.Telegraph</string>
-      <string>com.facebook.Messenger</string>
-      <string>com.atebits.Tweetie2</string>
-      <string>com.burbn.instagram</string>
-      <string>net.whatsapp.WhatsApp</string>
+      <string>AVCaptureSession</string>
+      <string>AVCaptureVideoDataOutput</string>
+      <string>AVCapturePhotoOutput</string>
+      <string>AVSampleBufferDisplayLayer</string>
+      <string>AVCaptureVideoPreviewLayer</string>
     </array>
+    <key>Mode</key>
+    <string>Any</string>
   </dict>
 </dict>
 </plist>
