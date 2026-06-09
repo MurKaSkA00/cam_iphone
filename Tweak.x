@@ -6,6 +6,10 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import "_MPUMediaBufferAdapter.h"
+#import "MPUKeys.h"
+
+// Определение ключа (объявлен в MPUKeys.h, используется и в AntifraudHooks.x)
+const void *kOverlayLayerKey = &kOverlayLayerKey;
 
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
@@ -312,14 +316,14 @@ static void _v_swizzleDelegate(id delegate) {
     if (!_enabled) return;
     _v_init();
 
-    CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
+    CALayer *overlay = objc_getAssociatedObject(self, kOverlayLayerKey);
     if (!overlay) {
         overlay = [CALayer layer];
         overlay.contentsGravity = kCAGravityResizeAspectFill;
         overlay.zPosition = 999999;
         overlay.backgroundColor = [UIColor blackColor].CGColor;
         [self addSublayer:overlay];
-        objc_setAssociatedObject(self, "_v_overlay",
+        objc_setAssociatedObject(self, kOverlayLayerKey,
             overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         NSLog(@"[MPU] Preview overlay created");
     }
@@ -339,7 +343,7 @@ static void _v_swizzleDelegate(id delegate) {
 - (void)display {
     %orig;
     if (!_enabled) return;
-    CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
+    CALayer *overlay = objc_getAssociatedObject(self, kOverlayLayerKey);
     if (!overlay) return;
     @synchronized(_v_lock) {
         if (_lastBuffer) {
