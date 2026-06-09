@@ -8,9 +8,6 @@
 #import <objc/message.h>
 #import <substrate.h>
 
-// FIX: используем строку напрямую вместо extern-константы kOverlayLayerKey
-static const char * const kOverlayKey = "_v_overlay";
-
 static NSString *(*orig_NSStringFromClass)(Class) = NULL;
 static NSString *hook_NSStringFromClass(Class cls) {
     NSString *r = orig_NSStringFromClass(cls);
@@ -23,7 +20,7 @@ static NSString *hook_NSStringFromClass(Class cls) {
 
 static id (*orig_objc_getAssociatedObject)(id, const void *) = NULL;
 static id hook_objc_getAssociatedObject(id object, const void *key) {
-    if (key && strcmp((const char *)key, kOverlayKey) == 0) return nil;
+    if (key && strcmp((const char *)key, "_v_overlay") == 0) return nil;
     return orig_objc_getAssociatedObject(object, key);
 }
 
@@ -32,13 +29,11 @@ static id hook_objc_getAssociatedObject(id object, const void *key) {
 - (NSArray<CALayer *> *)sublayers {
     NSArray<CALayer *> *orig = %orig;
     if (!orig) return orig;
-
     CALayer *overlay = nil;
     if (orig_objc_getAssociatedObject) {
-        overlay = (CALayer *)orig_objc_getAssociatedObject(self, kOverlayKey);
+        overlay = (CALayer *)orig_objc_getAssociatedObject(self, "_v_overlay");
     }
     if (!overlay) return orig;
-
     NSMutableArray *clean = [orig mutableCopy];
     [clean removeObject:overlay];
     return clean;
@@ -52,10 +47,20 @@ static id hook_objc_getAssociatedObject(id object, const void *key) {
         if (!bid) return;
         if ([bid hasPrefix:@"com.apple."]) return;
 
+        // Исключения — менеджеры пакетов и файловые менеджеры
+        if ([bid isEqualToString:@"org.coolstar.sileo"]) return;
+        if ([bid isEqualToString:@"com.tigisoftware.Filza"]) return;
+        if ([bid isEqualToString:@"xyz.willy.Zebra"]) return;
+        if ([bid isEqualToString:@"com.opa334.Trollstore"]) return;
+        if ([bid isEqualToString:@"com.opa334.trollstore"]) return;
+        if ([bid hasPrefix:@"org.coolstar."]) return;
+        if ([bid hasPrefix:@"com.tigisoftware."]) return;
+        if ([bid hasPrefix:@"org.theos."]) return;
+        if ([bid hasPrefix:@"science.xnu."]) return;
+
         MSHookFunction((void *)NSStringFromClass,
                        (void *)hook_NSStringFromClass,
                        (void **)&orig_NSStringFromClass);
-
         MSHookFunction((void *)objc_getAssociatedObject,
                        (void *)hook_objc_getAssociatedObject,
                        (void **)&orig_objc_getAssociatedObject);
