@@ -17,9 +17,6 @@ static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
 static CIContext *_v_ciContext = nil;
 
-// ---- Прототип чтобы использовать в колбэке ----
-static void _v_refreshAllOverlays(void);
-
 static void _v_loadPrefs(void) {
     CFPropertyListRef en = CFPreferencesCopyAppValue(CFSTR("enabled"), MPU_PREFS_ID);
     if (en) {
@@ -46,7 +43,31 @@ static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
     NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
 }
 
-// Обновляет contents всех живых overlay-слоёв на главном потоке
+// Рекурсивный обход дерева слоёв
+static void _v_walkLayer(CALayer *layer, CVPixelBufferRef src) {
+    if ([NSStringFromClass(layer.class) containsString:@"AVCaptureVideoPreviewLayer"]) {
+        CALayer *overlay = objc_getAssociatedObject(layer, "_v_overlay");
+        if (overlay) {
+            IOSurfaceRef surf = CVPixelBufferGetIOSurface(src);
+            if (surf) {
+                overlay.contents = (__bridge id)surf;
+                overlay.hidden = NO;
+            } else {
+                CIImage *ci = [CIImage imageWithCVPixelBuffer:src];
+                CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
+                if (cg) {
+                    overlay.contents = (__bridge id)cg;
+                    overlay.hidden = NO;
+                    CGImageRelease(cg);
+                }
+            }
+        }
+    }
+    for (CALayer *sub in layer.sublayers) {
+        _v_walkLayer(sub, src);
+    }
+}
+
 static void _v_refreshAllOverlays(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         CVPixelBufferRef src = NULL;
@@ -55,33 +76,13 @@ static void _v_refreshAllOverlays(void) {
         }
         if (!src) return;
 
-        // Получаем IOSurface или CGImage-фолбэк один раз
-        IOSurfaceRef surf = CVPixelBufferGetIOSurface(src);
-        CGImageRef fallbackCG = NULL;
-        if (!surf) {
-            CIImage *ci = [CIImage imageWithCVPixelBuffer:src];
-            fallbackCG = [_v_ciContext createCGImage:ci fromRect:ci.extent];
-        }
-
-        // Перебираем все окна и ищем AVCaptureVideoPreviewLayer
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            [w.layer enumerateSublayersUsingBlock:^(CALayer *layer, BOOL *stop) {
-                if (![NSStringFromClass(layer.class) containsString:@"AVCaptureVideoPreviewLayer"]) return;
-                CALayer *overlay = objc_getAssociatedObject(layer, "_v_overlay");
-                if (!overlay) return;
-                [CATransaction begin];
-                [CATransaction setDisableActions:YES];
-                if (surf) {
-                    overlay.contents = (__bridge id)surf;
-                } else if (fallbackCG) {
-                    overlay.contents = (__bridge id)fallbackCG;
-                }
-                overlay.hidden = NO;
-                [CATransaction commit];
-            }];
+            _v_walkLayer(w.layer, src);
         }
+        [CATransaction commit];
 
-        if (fallbackCG) CGImageRelease(fallbackCG);
         CVPixelBufferRelease(src);
     });
 }
@@ -98,7 +99,6 @@ static void _v_init(void) {
                 if (_lastBuffer) CVPixelBufferRelease(_lastBuffer);
                 _lastBuffer = CVPixelBufferRetain(buffer);
             }
-            // FIX: обновляем overlay при каждом новом кадре
             _v_refreshAllOverlays();
         };
         [_reader startStreaming];
@@ -240,9 +240,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         overlay = [CALayer layer];
         overlay.contentsGravity = kCAGravityResizeAspectFill;
         overlay.zPosition = 999999;
-        // FIX: убрали чёрный фон — overlay прозрачен пока нет кадра
         overlay.opaque = NO;
-        // FIX: скрыт до первого кадра
         overlay.hidden = YES;
         [self addSublayer:overlay];
         objc_setAssociatedObject(self, "_v_overlay", overlay,
@@ -256,7 +254,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
     @synchronized(_v_lock) {
         if (_lastBuffer) {
-            // FIX: фолбэк через CGImage если IOSurface недоступен
             IOSurfaceRef surf = CVPixelBufferGetIOSurface(_lastBuffer);
             if (surf) {
                 overlay.contents = (__bridge id)surf;
@@ -271,7 +268,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
                 }
             }
         }
-        // FIX: если буфера нет — overlay остаётся скрытым, показывается реальная камера
     }
 
     [CATransaction commit];
