@@ -1,4 +1,4 @@
-// FrameProcessor.m - MediaPlaybackUtils v1.4.2 (fixed)
+// FrameProcessor.m - MediaPlaybackUtils v1.4.2
 
 #import "FrameProcessor.h"
 #import <stdlib.h>
@@ -13,21 +13,16 @@
     return inst;
 }
 
-// FIX #4: этот метод теперь вызывается из Tweak.x на каждый входящий кадр.
-// Гарантирует что _lastBuffer всегда в формате BGRA + IOSurface (нужно для
-// CALayer.contents и CMSampleBuffer).
 - (CVPixelBufferRef)processBuffer:(CVPixelBufferRef)src {
     if (!src) return NULL;
 
     OSType fmt = CVPixelBufferGetPixelFormatType(src);
     IOSurfaceRef surf = CVPixelBufferGetIOSurface(src);
 
-    // Буфер уже в нужном формате — просто retain и вернуть
     if (fmt == kCVPixelFormatType_32BGRA && surf != NULL) {
         return (CVPixelBufferRef)CFRetain(src);
     }
 
-    // Конвертируем в BGRA с IOSurface
     size_t w = CVPixelBufferGetWidth(src);
     size_t h = CVPixelBufferGetHeight(src);
 
@@ -66,10 +61,14 @@
     CVPixelBufferUnlockBaseAddress(dst, 0);
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
 
-    return dst; // caller owns (retained by CVPixelBufferCreate)
+    return dst;
 }
 
-// FIX #5: jitteredTimingFromTiming удалён — нигде не использовался,
-// только добавлял лишний код и мусорил интерфейс.
+- (CMSampleTimingInfo)jitteredTimingFromTiming:(CMSampleTimingInfo)t {
+    int32_t jitter_us = (int32_t)(arc4random_uniform(1001)) - 500;
+    CMTime jitter = CMTimeMake(jitter_us, 1000000);
+    t.presentationTimeStamp = CMTimeAdd(t.presentationTimeStamp, jitter);
+    return t;
+}
 
 @end
