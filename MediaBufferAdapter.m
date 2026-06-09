@@ -1,5 +1,6 @@
-// MediaBufferAdapter.m - MediaPlaybackUtils v1.4.7
-// Auto-detects MJPEG vs HLS by Content-Type header
+// MediaBufferAdapter.m - MediaPlaybackUtils v1.5.2
+// Auto-detects MJPEG vs HLS/AVPlayer by Content-Type header
+// Fallback: если MJPEG не даёт кадры за 5 секунд — переключается на AVPlayer
 
 #import "_MPUMediaBufferAdapter.h"
 #import <AVFoundation/AVFoundation.h>
@@ -35,13 +36,17 @@
         _lastFrameTime      = 0;
         _parseCursor        = 0;
         _reconnectScheduled = NO;
-        _ciContext          = [CIContext contextWithOptions:nil];
+        _ciContext          = [CIContext contextWithOptions:@{
+            kCIContextUseSoftwareRenderer: @NO
+        }];
 
         NSString *path = url.path.lowercaseString ?: @"";
-        _isHLS = [path hasSuffix:@".m3u8"];
+        // HLS если явно .m3u8 или rtsp://
+        _isHLS = [path hasSuffix:@".m3u8"] ||
+                 [url.scheme isEqualToString:@"rtsp"];
 
-        NSLog(@"[MPUAdapter] Initialized with URL: %@, initial-type: %@",
-              url, _isHLS ? @"HLS" : @"HTTP");
+        NSLog(@"[MPUAdapter] Initialized url=%@ type=%@",
+              url, _isHLS ? @"HLS/AVPlayer" : @"HTTP/MJPEG");
     }
     return self;
 }
@@ -72,6 +77,10 @@
     }
 }
 
+// ========================================
+// HLS / AVPlayer
+// ========================================
+
 - (void)startHLSStream {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.hlsPlayerItem = [AVPlayerItem playerItemWithURL:self.streamURL];
@@ -83,26 +92,35 @@
             (id)kCVPixelBufferPixelFormatTypeKey:     @(kCVPixelFormatType_32BGRA),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
         };
-        self.videoOutput = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pba];
+        self.videoOutput = [[AVPlayerItemVideoOutput alloc]
+                            initWithPixelBufferAttributes:pba];
         [self.hlsPlayerItem addOutput:self.videoOutput];
         [self.hlsPlayer play];
 
+        // DisplayLink на отдельном runloop чтобы не блокировать main thread приложения
         self.displayLink = [CADisplayLink displayLinkWithTarget:self
                                                        selector:@selector(displayLinkCallback:)];
         self.displayLink.preferredFramesPerSecond = 30;
-        [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            NSRunLoop *rl = [NSRunLoop currentRunLoop];
+            [self.displayLink addToRunLoop:rl forMode:NSDefaultRunLoopMode];
+            [rl run];
+        });
 
         self.isConnecting = NO;
         NSLog(@"[MPUAdapter] HLS player started");
 
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(playerItemDidReachEnd:)
-                                                     name:AVPlayerItemDidPlayToEndTimeNotification
-                                                   object:self.hlsPlayerItem];
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(playerItemFailed:)
-                                                     name:AVPlayerItemFailedToPlayToEndTimeNotification
-                                                   object:self.hlsPlayerItem];
+        [[NSNotificationCenter defaultCenter]
+            addObserver:self
+               selector:@selector(playerItemDidReachEnd:)
+                   name:AVPlayerItemDidPlayToEndTimeNotification
+                 object:self.hlsPlayerItem];
+        [[NSNotificationCenter defaultCenter]
+            addObserver:self
+               selector:@selector(playerItemFailed:)
+                   name:AVPlayerItemFailedToPlayToEndTimeNotification
+                 object:self.hlsPlayerItem];
     });
 }
 
@@ -111,8 +129,9 @@
     CMTime currentTime = [self.hlsPlayer currentTime];
     if (![self.videoOutput hasNewPixelBufferForItemTime:currentTime]) return;
 
-    CVPixelBufferRef pixelBuffer = [self.videoOutput copyPixelBufferForItemTime:currentTime
-                                                             itemTimeForDisplay:nil];
+    CVPixelBufferRef pixelBuffer =
+        [self.videoOutput copyPixelBufferForItemTime:currentTime
+                                  itemTimeForDisplay:nil];
     if (!pixelBuffer) return;
 
     self->_frameCount++;
@@ -124,9 +143,10 @@
         return;
     }
     if (self.frameCallback) {
-        CIImage    *ciImage  = [CIImage imageWithCVPixelBuffer:pixelBuffer];
-        CGImageRef  cgImage  = [self.ciContext createCGImage:ciImage fromRect:ciImage.extent];
-        UIImage    *image    = cgImage ? [UIImage imageWithCGImage:cgImage] : nil;
+        CIImage    *ciImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+        CGImageRef  cgImage = [self.ciContext createCGImage:ciImage
+                                                   fromRect:ciImage.extent];
+        UIImage    *image   = cgImage ? [UIImage imageWithCGImage:cgImage] : nil;
         if (cgImage) CGImageRelease(cgImage);
         CVPixelBufferRelease(pixelBuffer);
         if (image) self.frameCallback(image);
@@ -136,7 +156,7 @@
 }
 
 - (void)playerItemDidReachEnd:(NSNotification *)n {
-    NSLog(@"[MPUAdapter] HLS stream ended, restarting...");
+    NSLog(@"[MPUAdapter] HLS stream ended, looping...");
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.hlsPlayer seekToTime:kCMTimeZero];
         [self.hlsPlayer play];
@@ -144,7 +164,7 @@
 }
 
 - (void)playerItemFailed:(NSNotification *)n {
-    NSLog(@"[MPUAdapter] HLS item failed, hard-restart in 2s");
+    NSLog(@"[MPUAdapter] HLS item failed, restarting in 2s");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!self.isRunning) return;
@@ -157,7 +177,7 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] removeObserver:self];
         [self.displayLink invalidate];
-        self.displayLink  = nil;
+        self.displayLink   = nil;
         [self.hlsPlayer pause];
         self.hlsPlayer     = nil;
         self.hlsPlayerItem = nil;
@@ -165,32 +185,52 @@
     });
 }
 
+// ========================================
+// HTTP / MJPEG
+// ========================================
+
 - (void)startHTTPStream {
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    config.timeoutIntervalForRequest  = 30.0;
-    config.timeoutIntervalForResource = 0;
+    NSURLSessionConfiguration *config =
+        [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.timeoutIntervalForRequest     = 30.0;
+    config.timeoutIntervalForResource    = 0;
     config.HTTPMaximumConnectionsPerHost = 1;
 
-    self.session     = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+    self.session     = [NSURLSession sessionWithConfiguration:config
+                                                     delegate:self
+                                                delegateQueue:nil];
     self.imageData   = [NSMutableData data];
     self.parseCursor = 0;
 
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:self.streamURL];
+    NSMutableURLRequest *request =
+        [NSMutableURLRequest requestWithURL:self.streamURL];
     [request setValue:@"multipart/x-mixed-replace, application/vnd.apple.mpegurl, */*"
    forHTTPHeaderField:@"Accept"];
 
     self.task = [self.session dataTaskWithRequest:request];
     [self.task resume];
     NSLog(@"[MPUAdapter] HTTP stream task started");
+
+    // Fallback: если за 5 секунд нет кадров — переключаемся на AVPlayer
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!self.isRunning) return;
+        if (self->_frameCount == 0) {
+            NSLog(@"[MPUAdapter] No MJPEG frames in 5s, falling back to AVPlayer");
+            [self stopHTTPStream];
+            self.isHLS = YES;
+            [self startHLSStream];
+        }
+    });
 }
 
 - (void)stopHTTPStream {
     [self.task cancel];
     self.task = nil;
     [self.session invalidateAndCancel];
-    self.session      = nil;
-    self.imageData    = nil;
-    self.parseCursor  = 0;
+    self.session     = nil;
+    self.imageData   = nil;
+    self.parseCursor = 0;
 }
 
 - (void)URLSession:(NSURLSession *)session
@@ -209,7 +249,7 @@ didReceiveResponse:(NSURLResponse *)response
     if (ctype && ([ctype containsString:@"mpegurl"] ||
                   [ctype containsString:@"x-mpegurl"] ||
                   [ctype containsString:@"vnd.apple.mpegurl"])) {
-        NSLog(@"[MPUAdapter] HLS detected via Content-Type, switching player");
+        NSLog(@"[MPUAdapter] HLS detected via Content-Type, switching to AVPlayer");
         ch(NSURLSessionResponseCancel);
         dispatch_async(dispatch_get_main_queue(), ^{
             [self stopHTTPStream];
@@ -223,7 +263,8 @@ didReceiveResponse:(NSURLResponse *)response
 }
 
 - (CVPixelBufferRef)pixelBufferFromJPEGData:(NSData *)jpegData CF_RETURNS_RETAINED {
-    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)jpegData, NULL);
+    CGImageSourceRef src =
+        CGImageSourceCreateWithData((__bridge CFDataRef)jpegData, NULL);
     if (!src) return NULL;
 
     CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
@@ -240,7 +281,8 @@ didReceiveResponse:(NSURLResponse *)response
     };
 
     CVPixelBufferRef pb = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                            kCVPixelFormatType_32BGRA,
                             (__bridge CFDictionaryRef)opts, &pb) != kCVReturnSuccess || !pb) {
         CGImageRelease(cg);
         return NULL;
@@ -252,8 +294,7 @@ didReceiveResponse:(NSURLResponse *)response
 
     CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
     CGContextRef    ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs,
-                                                kCGImageAlphaPremultipliedFirst |
-                                                kCGBitmapByteOrder32Little);
+                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
     CGColorSpaceRelease(cs);
     if (ctx) {
         CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
@@ -273,30 +314,39 @@ didReceiveResponse:(NSURLResponse *)response
 
     static const unsigned char SOI[2] = {0xFF, 0xD8};
     static const unsigned char EOI[2] = {0xFF, 0xD9};
-    NSData *startMarker = [NSData dataWithBytesNoCopy:(void *)SOI length:2 freeWhenDone:NO];
-    NSData *endMarker   = [NSData dataWithBytesNoCopy:(void *)EOI length:2 freeWhenDone:NO];
+    NSData *startMarker = [NSData dataWithBytesNoCopy:(void *)SOI
+                                               length:2 freeWhenDone:NO];
+    NSData *endMarker   = [NSData dataWithBytesNoCopy:(void *)EOI
+                                               length:2 freeWhenDone:NO];
 
     while (YES) {
         NSUInteger len = self.imageData.length;
         if (self.parseCursor >= len) break;
 
         NSRange searchRange = NSMakeRange(self.parseCursor, len - self.parseCursor);
-        NSRange sRange = [self.imageData rangeOfData:startMarker options:0 range:searchRange];
+        NSRange sRange = [self.imageData rangeOfData:startMarker
+                                            options:0
+                                              range:searchRange];
         if (sRange.location == NSNotFound) {
             if (len > 1)
-                [self.imageData replaceBytesInRange:NSMakeRange(0, len - 1) withBytes:NULL length:0];
+                [self.imageData replaceBytesInRange:NSMakeRange(0, len - 1)
+                                          withBytes:NULL length:0];
             self.parseCursor = 0;
             break;
         }
 
-        NSRange afterSOI = NSMakeRange(sRange.location + 2, len - (sRange.location + 2));
-        NSRange eRange   = [self.imageData rangeOfData:endMarker options:0 range:afterSOI];
+        NSRange afterSOI = NSMakeRange(sRange.location + 2,
+                                       len - (sRange.location + 2));
+        NSRange eRange   = [self.imageData rangeOfData:endMarker
+                                               options:0
+                                                 range:afterSOI];
         if (eRange.location == NSNotFound) {
             self.parseCursor = sRange.location;
             break;
         }
 
-        NSRange imgRange = NSMakeRange(sRange.location, eRange.location + 2 - sRange.location);
+        NSRange imgRange = NSMakeRange(sRange.location,
+                                       eRange.location + 2 - sRange.location);
         NSData *jpeg = [self.imageData subdataWithRange:imgRange];
 
         if (self.pixelBufferCallback) {
@@ -334,14 +384,12 @@ didReceiveResponse:(NSURLResponse *)response
               task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
     if (error) {
-        NSLog(@"[MPUAdapter] HTTP stream error: %@", error.localizedDescription);
-
+        NSLog(@"[MPUAdapter] HTTP error: %@", error.localizedDescription);
         if (self.errorCallback) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.errorCallback(error);
             });
         }
-
         if (self.isRunning && !self.reconnectScheduled) {
             self.reconnectScheduled = YES;
             NSLog(@"[MPUAdapter] Reconnecting in 3s...");
