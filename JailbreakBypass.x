@@ -1,9 +1,6 @@
-// JailbreakBypass.x - MediaPlaybackUtils v1.4.3
-// ФИКСЫ v1.4.3:
-//   - убран hook_fork (ломал Sileo/Filza/palera1n)
-//   - hook_dlopen НЕ блокирует /var/jb/ — блокирует только substrate/hooker dylib
-//   - hook_open/fopen/stat НЕ трогают dpkg/status (нужен Sileo)
-//   - все хуки пропускают jailbreak-инструменты по bundle id
+// JailbreakBypass.x - MediaPlaybackUtils v1.4.3 (FIXED)
+// Скрывает джейлбрейк ТОЛЬКО от конкретных целевых приложений.
+// НЕ убивает Sileo, Filza, palera1n, Chrome.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -18,42 +15,26 @@
 #import <string.h>
 #import <errno.h>
 
-// ─── Список bundle id которые должны видеть всё как есть ─────────────────────
-static BOOL _jb_is_trusted_app(void) {
-    static BOOL trusted = NO;
+// ========================================
+// СПИСОК ПРИЛОЖЕНИЙ, от которых скрываем джейл.
+// ИСПРАВЛЕНИЕ: добавь сюда только нужные bundle ID.
+// Sileo, Filza, Chrome, palera1n — НЕ должны быть тут.
+// ========================================
+static NSArray<NSString *> *_jb_targetBundles(void) {
+    static NSArray *list = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        if (!bid) return;
-        // Sileo, Zebra, Filza, Installer, palera1n, SSH клиенты и т.п.
-        NSArray *whitelist = @[
-            @"org.coolstar.SileoStore",
-            @"com.silverhawkx.sileo",
-            @"xyz.willy.Zebra",
-            @"com.tigisoftware.Filza",
-            @"com.sparklabs.Installer",
-            @"cool.palera1n",
-            @"com.opa334.TrollStore",
-            @"com.opa334.TrollStorePersistenceHelper",
-            @"com.openssh.openssh-client",
-            @"net.whine.Controllerplus",
-            @"com.julioverne.newterm",
-            @"com.googlecode.iterm2",
+        list = @[
+            // Добавь bundle ID приложений, которым нужно скрыть джейл:
+            // @"com.example.targetapp",
+            // @"com.bank.app",
         ];
-        for (NSString *w in whitelist) {
-            if ([bid hasPrefix:w] || [bid isEqualToString:w]) {
-                trusted = YES;
-                return;
-            }
-        }
-        // Любой bundle из /var/jb/ — тоже trusted (системные jb-компоненты)
-        NSString *path = [[NSBundle mainBundle] bundlePath];
-        if ([path hasPrefix:@"/var/jb/"]) trusted = YES;
     });
-    return trusted;
+    return list;
 }
 
-// ─── Пути которые прячем от целевых (НЕ доверенных) приложений ───────────────
+static BOOL _jb_shouldBypass = NO;
+
 static NSArray<NSString *> *_jb_blacklist(void) {
     static NSArray *list = nil;
     static dispatch_once_t once;
@@ -74,17 +55,14 @@ static NSArray<NSString *> *_jb_blacklist(void) {
             @"/private/var/lib/cydia",
             @"/private/var/stash",
             @"/private/var/tmp/cydia.log",
+            // ИСПРАВЛЕНИЕ: /var/jb НЕ добавляем полностью в blacklist,
+            // иначе Sileo/Filza которые живут там перестанут работать.
+            // Добавляем только конкретные файлы-индикаторы:
+            @"/var/jb/.jailbroken",
             @"/.installed_unc0ver",
             @"/.bootstrapped_electra",
             @"/taurine",
-            @"/jb",
             @"/palera1n",
-            // НЕ блокируем /var/jb/ целиком — там живут доверенные инструменты
-            // Блокируем только конкретные маркеры
-            @"/var/jb/usr/lib/TweakInject",
-            @"/var/jb/usr/lib/libhooker.dylib",
-            @"/var/jb/usr/lib/libsubstrate.dylib",
-            @"/var/jb/Library/MobileSubstrate",
         ];
     });
     return list;
@@ -92,15 +70,8 @@ static NSArray<NSString *> *_jb_blacklist(void) {
 
 static BOOL _path_is_blacklisted(const char *path) {
     if (!path || strlen(path) == 0) return NO;
-    if (_jb_is_trusted_app()) return NO; // trusted apps видят всё
-
     NSString *s = [NSString stringWithUTF8String:path];
     if (!s) return NO;
-
-    // dpkg/status НИКОГДА не блокируем — нужен Sileo
-    if ([s containsString:@"dpkg/status"]) return NO;
-    if ([s containsString:@"dpkg/info"])   return NO;
-
     for (NSString *bad in _jb_blacklist()) {
         if ([s isEqualToString:bad]) return YES;
         if ([s hasPrefix:[bad stringByAppendingString:@"/"]]) return YES;
@@ -108,28 +79,31 @@ static BOOL _path_is_blacklisted(const char *path) {
     return NO;
 }
 
-// ─── C-хуки ──────────────────────────────────────────────────────────────────
+// ========================================
+// SYSCALL HOOKS — активны только если _jb_shouldBypass == YES
+// ========================================
+
 static int (*orig_stat)(const char *, struct stat *);
 static int hook_stat(const char *path, struct stat *buf) {
-    if (_path_is_blacklisted(path)) { errno = ENOENT; return -1; }
+    if (_jb_shouldBypass && _path_is_blacklisted(path)) { errno = ENOENT; return -1; }
     return orig_stat(path, buf);
 }
 
 static int (*orig_lstat)(const char *, struct stat *);
 static int hook_lstat(const char *path, struct stat *buf) {
-    if (_path_is_blacklisted(path)) { errno = ENOENT; return -1; }
+    if (_jb_shouldBypass && _path_is_blacklisted(path)) { errno = ENOENT; return -1; }
     return orig_lstat(path, buf);
 }
 
 static int (*orig_access)(const char *, int);
 static int hook_access(const char *path, int mode) {
-    if (_path_is_blacklisted(path)) { errno = ENOENT; return -1; }
+    if (_jb_shouldBypass && _path_is_blacklisted(path)) { errno = ENOENT; return -1; }
     return orig_access(path, mode);
 }
 
 static int (*orig_open)(const char *, int, ...);
 static int hook_open(const char *path, int flags, ...) {
-    if (_path_is_blacklisted(path)) { errno = ENOENT; return -1; }
+    if (_jb_shouldBypass && _path_is_blacklisted(path)) { errno = ENOENT; return -1; }
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags);
@@ -141,57 +115,61 @@ static int hook_open(const char *path, int flags, ...) {
 
 static FILE *(*orig_fopen)(const char *, const char *);
 static FILE *hook_fopen(const char *path, const char *mode) {
-    if (_path_is_blacklisted(path)) { errno = ENOENT; return NULL; }
+    if (_jb_shouldBypass && _path_is_blacklisted(path)) { errno = ENOENT; return NULL; }
     return orig_fopen(path, mode);
 }
 
 static DIR *(*orig_opendir)(const char *);
 static DIR *hook_opendir(const char *path) {
-    if (_path_is_blacklisted(path)) { errno = ENOENT; return NULL; }
+    if (_jb_shouldBypass && _path_is_blacklisted(path)) { errno = ENOENT; return NULL; }
     return orig_opendir(path);
 }
 
-// fork() убран полностью — ломал Sileo/Filza/palera1n
+// ИСПРАВЛЕНИЕ: hook_fork УДАЛЁН — он убивал Chrome, WKWebView и другие приложения.
+// fork не является надёжным индикатором джейлбрейка в iOS 15+.
 
 static char *(*orig_getenv)(const char *);
 static char *hook_getenv(const char *name) {
     if (!name) return orig_getenv(name);
-    if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) return NULL;
-    if (strcmp(name, "_MSSafeMode") == 0)           return NULL;
-    if (strcmp(name, "_SafeMode") == 0)             return NULL;
+    if (_jb_shouldBypass) {
+        if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) return NULL;
+        if (strcmp(name, "_MSSafeMode") == 0) return NULL;
+        if (strcmp(name, "_SafeMode") == 0) return NULL;
+    }
     return orig_getenv(name);
 }
 
+// ИСПРАВЛЕНИЕ: dlopen hook НЕ блокирует /var/jb/ целиком —
+// иначе Sileo и Filza не смогут загрузить свои либы.
 static void *(*orig_dlopen)(const char *, int);
 static void *hook_dlopen(const char *path, int mode) {
-    // Блокируем только конкретные substrate/hooker библиотеки,
-    // НЕ всё что в /var/jb/ — там живут нормальные приложения
-    if (path) {
+    if (_jb_shouldBypass && path) {
         NSString *p = [NSString stringWithUTF8String:path];
         if (p) {
-            if ([p containsString:@"MobileSubstrate"])  return NULL;
-            if ([p containsString:@"libsubstrate"])      return NULL;
-            if ([p containsString:@"libhooker"])         return NULL;
-            if ([p containsString:@"libellekit"])        return NULL;
-            if ([p containsString:@"Substitute"])        return NULL;
-            if ([p containsString:@"TweakInject"])       return NULL;
+            // Блокируем только конкретные substrate-библиотеки:
+            if ([p hasSuffix:@"/libsubstrate.dylib"]) return NULL;
+            if ([p hasSuffix:@"/libhooker.dylib"]) return NULL;
+            if ([p hasSuffix:@"/libellekit.dylib"]) return NULL;
+            // НЕ блокируем весь /var/jb/ — там живёт Sileo/Filza
         }
     }
     return orig_dlopen(path, mode);
 }
 
-// ─── ObjC хуки ───────────────────────────────────────────────────────────────
+// ========================================
+// ObjC HOOKS
+// ========================================
+
 %hook NSFileManager
 
 - (BOOL)fileExistsAtPath:(NSString *)path {
-    if (path && !_jb_is_trusted_app() &&
-        _path_is_blacklisted([path fileSystemRepresentation])) return NO;
+    if (_jb_shouldBypass && path && _path_is_blacklisted([path fileSystemRepresentation]))
+        return NO;
     return %orig;
 }
 
 - (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDir {
-    if (path && !_jb_is_trusted_app() &&
-        _path_is_blacklisted([path fileSystemRepresentation])) {
+    if (_jb_shouldBypass && path && _path_is_blacklisted([path fileSystemRepresentation])) {
         if (isDir) *isDir = NO;
         return NO;
     }
@@ -200,18 +178,13 @@ static void *hook_dlopen(const char *path, int mode) {
 
 - (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error {
     NSArray *orig = %orig;
-    if (!orig || !path || _jb_is_trusted_app()) return orig;
-    if ([path isEqualToString:@"/"] ||
-        [path isEqualToString:@"/Applications"] ||
-        [path isEqualToString:@"/var"]) {
+    if (!_jb_shouldBypass || !orig || !path) return orig;
+    if ([path isEqualToString:@"/"] || [path isEqualToString:@"/Applications"]) {
         NSMutableArray *clean = [orig mutableCopy];
-        [clean removeObject:@"jb"];
         [clean removeObject:@"Cydia.app"];
-        [clean removeObject:@"Sileo.app"];
-        [clean removeObject:@"Zebra.app"];
+        [clean removeObject:@"Sileo.app"];     // скрываем от целевого приложения
         [clean removeObject:@".installed_unc0ver"];
         [clean removeObject:@".bootstrapped_electra"];
-        [clean removeObject:@"palera1n"];
         return clean;
     }
     return orig;
@@ -222,46 +195,69 @@ static void *hook_dlopen(const char *path, int mode) {
 %hook UIApplication
 
 - (BOOL)canOpenURL:(NSURL *)url {
-    if (_jb_is_trusted_app()) return %orig;
+    if (!_jb_shouldBypass) return %orig;
     NSString *scheme = url.scheme.lowercaseString;
     if (scheme) {
-        if ([scheme isEqualToString:@"cydia"])      return NO;
-        if ([scheme isEqualToString:@"zbra"])        return NO;
-        if ([scheme isEqualToString:@"undecimus"])   return NO;
-        if ([scheme isEqualToString:@"activator"])   return NO;
-        if ([scheme isEqualToString:@"apt-repo"])    return NO;
-        // sileo:// и filza:// НЕ блокируем — это легитимные deeplinks
+        if ([scheme isEqualToString:@"cydia"]) return NO;
+        if ([scheme isEqualToString:@"sileo"]) return NO;
+        if ([scheme isEqualToString:@"zbra"]) return NO;
+        // ИСПРАВЛЕНИЕ: filza НЕ убиваем — это нужный инструмент
+        if ([scheme isEqualToString:@"undecimus"]) return NO;
+        if ([scheme isEqualToString:@"activator"]) return NO;
+        if ([scheme isEqualToString:@"apt-repo"]) return NO;
     }
     return %orig;
 }
 
-- (BOOL)openURL:(NSURL *)url {
-    if (_jb_is_trusted_app()) return %orig;
-    NSString *scheme = url.scheme.lowercaseString;
-    if (scheme && [scheme isEqualToString:@"cydia"]) return NO;
-    return %orig;
-}
-
 %end
+
+// ========================================
+// ИНИЦИАЛИЗАЦИЯ
+// ========================================
 
 %ctor {
     @autoreleasepool {
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         if (!bid) return;
 
-        // В системных процессах Apple не вешаем ничего
+        // ИСПРАВЛЕНИЕ: bypass активируем ТОЛЬКО для перечисленных bundle ID.
+        // com.apple.* — никогда не трогаем.
+        // Sileo, Filza, Chrome — не в списке => bypass НЕ активируется => они работают.
+
         if ([bid hasPrefix:@"com.apple."]) return;
 
-        MSHookFunction((void *)stat,    (void *)hook_stat,    (void **)&orig_stat);
-        MSHookFunction((void *)lstat,   (void *)hook_lstat,   (void **)&orig_lstat);
-        MSHookFunction((void *)access,  (void *)hook_access,  (void **)&orig_access);
-        MSHookFunction((void *)open,    (void *)hook_open,    (void **)&orig_open);
-        MSHookFunction((void *)fopen,   (void *)hook_fopen,   (void **)&orig_fopen);
-        MSHookFunction((void *)opendir, (void *)hook_opendir, (void **)&orig_opendir);
-        MSHookFunction((void *)getenv,  (void *)hook_getenv,  (void **)&orig_getenv);
-        MSHookFunction((void *)dlopen,  (void *)hook_dlopen,  (void **)&orig_dlopen);
+        NSArray *targets = _jb_targetBundles();
+        if (targets.count > 0) {
+            // Режим whitelist: только указанные приложения
+            _jb_shouldBypass = [targets containsObject:bid];
+        } else {
+            // Если список пустой — применяем ко всем сторонним приложениям
+            // (кроме известных jb-инструментов)
+            BOOL isSileo = [bid isEqualToString:@"org.coolstar.SileoStore"];
+            BOOL isZebra = [bid isEqualToString:@"xyz.willy.Zebra"];
+            BOOL isFilza = [bid isEqualToString:@"com.tigisoftware.Filza"];
+            BOOL isChrome = [bid isEqualToString:@"com.google.chrome.ios"];
+            BOOL isPalera1n = [bid hasPrefix:@"com.palera1n"];
+            _jb_shouldBypass = !(isSileo || isZebra || isFilza || isChrome || isPalera1n);
+        }
+
+        if (!_jb_shouldBypass) {
+            NSLog(@"[MPU/JBBypass] Skipping bypass for: %@", bid);
+            return;
+        }
+
+        // Устанавливаем syscall хуки
+        MSHookFunction((void *)stat,     (void *)hook_stat,     (void **)&orig_stat);
+        MSHookFunction((void *)lstat,    (void *)hook_lstat,    (void **)&orig_lstat);
+        MSHookFunction((void *)access,   (void *)hook_access,   (void **)&orig_access);
+        MSHookFunction((void *)open,     (void *)hook_open,     (void **)&orig_open);
+        MSHookFunction((void *)fopen,    (void *)hook_fopen,    (void **)&orig_fopen);
+        MSHookFunction((void *)opendir,  (void *)hook_opendir,  (void **)&orig_opendir);
+        // fork НЕ хукаем — убивал Chrome/WKWebView
+        MSHookFunction((void *)getenv,   (void *)hook_getenv,   (void **)&orig_getenv);
+        MSHookFunction((void *)dlopen,   (void *)hook_dlopen,   (void **)&orig_dlopen);
 
         %init;
-        NSLog(@"[MPU/JBBypass] Installed for %@", bid);
+        NSLog(@"[MPU/JBBypass] Active for: %@", bid);
     }
 }
