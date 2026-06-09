@@ -1,5 +1,9 @@
-// JailbreakBypass.x - MediaPlaybackUtils v1.4.2
-// Скрывает следы джейлбрейка (palera1n rootless, iOS 15-17) от приложения-хоста.
+// JailbreakBypass.x - MediaPlaybackUtils v1.4.3
+// ФИКСЫ v1.4.3:
+//   - убран hook_fork (ломал Sileo/Filza/palera1n)
+//   - hook_dlopen НЕ блокирует /var/jb/ — блокирует только substrate/hooker dylib
+//   - hook_open/fopen/stat НЕ трогают dpkg/status (нужен Sileo)
+//   - все хуки пропускают jailbreak-инструменты по bundle id
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -14,49 +18,97 @@
 #import <string.h>
 #import <errno.h>
 
+// ─── Список bundle id которые должны видеть всё как есть ─────────────────────
+static BOOL _jb_is_trusted_app(void) {
+    static BOOL trusted = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if (!bid) return;
+        // Sileo, Zebra, Filza, Installer, palera1n, SSH клиенты и т.п.
+        NSArray *whitelist = @[
+            @"org.coolstar.SileoStore",
+            @"com.silverhawkx.sileo",
+            @"xyz.willy.Zebra",
+            @"com.tigisoftware.Filza",
+            @"com.sparklabs.Installer",
+            @"cool.palera1n",
+            @"com.opa334.TrollStore",
+            @"com.opa334.TrollStorePersistenceHelper",
+            @"com.openssh.openssh-client",
+            @"net.whine.Controllerplus",
+            @"com.julioverne.newterm",
+            @"com.googlecode.iterm2",
+        ];
+        for (NSString *w in whitelist) {
+            if ([bid hasPrefix:w] || [bid isEqualToString:w]) {
+                trusted = YES;
+                return;
+            }
+        }
+        // Любой bundle из /var/jb/ — тоже trusted (системные jb-компоненты)
+        NSString *path = [[NSBundle mainBundle] bundlePath];
+        if ([path hasPrefix:@"/var/jb/"]) trusted = YES;
+    });
+    return trusted;
+}
+
+// ─── Пути которые прячем от целевых (НЕ доверенных) приложений ───────────────
 static NSArray<NSString *> *_jb_blacklist(void) {
     static NSArray *list = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         list = @[
-            @"/Applications/Cydia.app", @"/Applications/Sileo.app",
-            @"/Applications/Zebra.app", @"/Applications/Installer.app",
-            @"/Library/MobileSubstrate", @"/Library/Substitute",
-            @"/usr/lib/libsubstrate.dylib", @"/usr/lib/libhooker.dylib",
-            @"/usr/lib/substrate", @"/usr/bin/cycript",
-            @"/usr/bin/ssh", @"/usr/sbin/sshd",
-            @"/etc/apt", @"/etc/ssh/sshd_config",
-            @"/private/var/lib/apt", @"/private/var/lib/cydia",
-            @"/private/var/stash", @"/private/var/mobile/Library/SBSettings",
+            @"/Applications/Cydia.app",
+            @"/Library/MobileSubstrate",
+            @"/Library/Substitute",
+            @"/usr/lib/libsubstrate.dylib",
+            @"/usr/lib/libhooker.dylib",
+            @"/usr/lib/substrate",
+            @"/usr/bin/cycript",
+            @"/usr/bin/ssh",
+            @"/usr/sbin/sshd",
+            @"/etc/apt",
+            @"/etc/ssh/sshd_config",
+            @"/private/var/lib/apt",
+            @"/private/var/lib/cydia",
+            @"/private/var/stash",
             @"/private/var/tmp/cydia.log",
-            @"/var/jb", @"/var/jb/Applications/Sileo.app",
-            @"/var/jb/Library/MobileSubstrate", @"/var/jb/usr/lib/TweakInject",
-            @"/var/jb/usr/lib/libhooker.dylib", @"/var/jb/usr/lib/libsubstrate.dylib",
-            @"/var/jb/usr/bin/sileo", @"/var/jb/etc/apt",
-            @"/var/jb/var/lib/apt", @"/var/jb/var/lib/dpkg",
-            @"/bin/bash", @"/bin/sh",
-            @"/var/jb/bin/bash", @"/var/jb/bin/sh",
-            @"/.installed_unc0ver", @"/.bootstrapped_electra",
-            @"/taurine", @"/jb", @"/palera1n",
+            @"/.installed_unc0ver",
+            @"/.bootstrapped_electra",
+            @"/taurine",
+            @"/jb",
+            @"/palera1n",
+            // НЕ блокируем /var/jb/ целиком — там живут доверенные инструменты
+            // Блокируем только конкретные маркеры
+            @"/var/jb/usr/lib/TweakInject",
+            @"/var/jb/usr/lib/libhooker.dylib",
+            @"/var/jb/usr/lib/libsubstrate.dylib",
+            @"/var/jb/Library/MobileSubstrate",
         ];
     });
     return list;
 }
 
 static BOOL _path_is_blacklisted(const char *path) {
-    if (!path) return NO;
-    if (strlen(path) == 0) return NO;
+    if (!path || strlen(path) == 0) return NO;
+    if (_jb_is_trusted_app()) return NO; // trusted apps видят всё
+
     NSString *s = [NSString stringWithUTF8String:path];
     if (!s) return NO;
+
+    // dpkg/status НИКОГДА не блокируем — нужен Sileo
+    if ([s containsString:@"dpkg/status"]) return NO;
+    if ([s containsString:@"dpkg/info"])   return NO;
+
     for (NSString *bad in _jb_blacklist()) {
         if ([s isEqualToString:bad]) return YES;
         if ([s hasPrefix:[bad stringByAppendingString:@"/"]]) return YES;
     }
-    if ([s hasPrefix:@"/var/jb/"]) return YES;
-    if ([s hasPrefix:@"/private/var/jb/"]) return YES;
     return NO;
 }
 
+// ─── C-хуки ──────────────────────────────────────────────────────────────────
 static int (*orig_stat)(const char *, struct stat *);
 static int hook_stat(const char *path, struct stat *buf) {
     if (_path_is_blacklisted(path)) { errno = ENOENT; return -1; }
@@ -99,44 +151,47 @@ static DIR *hook_opendir(const char *path) {
     return orig_opendir(path);
 }
 
-static pid_t (*orig_fork)(void);
-static pid_t hook_fork(void) { errno = ENOSYS; return -1; }
+// fork() убран полностью — ломал Sileo/Filza/palera1n
 
 static char *(*orig_getenv)(const char *);
 static char *hook_getenv(const char *name) {
     if (!name) return orig_getenv(name);
     if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) return NULL;
-    if (strcmp(name, "_MSSafeMode") == 0) return NULL;
-    if (strcmp(name, "_SafeMode") == 0) return NULL;
+    if (strcmp(name, "_MSSafeMode") == 0)           return NULL;
+    if (strcmp(name, "_SafeMode") == 0)             return NULL;
     return orig_getenv(name);
 }
 
 static void *(*orig_dlopen)(const char *, int);
 static void *hook_dlopen(const char *path, int mode) {
+    // Блокируем только конкретные substrate/hooker библиотеки,
+    // НЕ всё что в /var/jb/ — там живут нормальные приложения
     if (path) {
         NSString *p = [NSString stringWithUTF8String:path];
         if (p) {
-            if ([p containsString:@"MobileSubstrate"]) return NULL;
-            if ([p containsString:@"libsubstrate"]) return NULL;
-            if ([p containsString:@"libhooker"]) return NULL;
-            if ([p containsString:@"libellekit"]) return NULL;
-            if ([p containsString:@"Substitute"]) return NULL;
-            if ([p containsString:@"TweakInject"]) return NULL;
-            if ([p hasPrefix:@"/var/jb/"]) return NULL;
+            if ([p containsString:@"MobileSubstrate"])  return NULL;
+            if ([p containsString:@"libsubstrate"])      return NULL;
+            if ([p containsString:@"libhooker"])         return NULL;
+            if ([p containsString:@"libellekit"])        return NULL;
+            if ([p containsString:@"Substitute"])        return NULL;
+            if ([p containsString:@"TweakInject"])       return NULL;
         }
     }
     return orig_dlopen(path, mode);
 }
 
+// ─── ObjC хуки ───────────────────────────────────────────────────────────────
 %hook NSFileManager
 
 - (BOOL)fileExistsAtPath:(NSString *)path {
-    if (path && _path_is_blacklisted([path fileSystemRepresentation])) return NO;
+    if (path && !_jb_is_trusted_app() &&
+        _path_is_blacklisted([path fileSystemRepresentation])) return NO;
     return %orig;
 }
 
 - (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDir {
-    if (path && _path_is_blacklisted([path fileSystemRepresentation])) {
+    if (path && !_jb_is_trusted_app() &&
+        _path_is_blacklisted([path fileSystemRepresentation])) {
         if (isDir) *isDir = NO;
         return NO;
     }
@@ -145,8 +200,10 @@ static void *hook_dlopen(const char *path, int mode) {
 
 - (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error {
     NSArray *orig = %orig;
-    if (!orig || !path) return orig;
-    if ([path isEqualToString:@"/"] || [path isEqualToString:@"/Applications"] || [path isEqualToString:@"/var"]) {
+    if (!orig || !path || _jb_is_trusted_app()) return orig;
+    if ([path isEqualToString:@"/"] ||
+        [path isEqualToString:@"/Applications"] ||
+        [path isEqualToString:@"/var"]) {
         NSMutableArray *clean = [orig mutableCopy];
         [clean removeObject:@"jb"];
         [clean removeObject:@"Cydia.app"];
@@ -165,25 +222,23 @@ static void *hook_dlopen(const char *path, int mode) {
 %hook UIApplication
 
 - (BOOL)canOpenURL:(NSURL *)url {
+    if (_jb_is_trusted_app()) return %orig;
     NSString *scheme = url.scheme.lowercaseString;
     if (scheme) {
-        if ([scheme isEqualToString:@"cydia"]) return NO;
-        if ([scheme isEqualToString:@"sileo"]) return NO;
-        if ([scheme isEqualToString:@"zbra"]) return NO;
-        if ([scheme isEqualToString:@"filza"]) return NO;
-        if ([scheme isEqualToString:@"undecimus"]) return NO;
-        if ([scheme isEqualToString:@"activator"]) return NO;
-        if ([scheme isEqualToString:@"apt-repo"]) return NO;
+        if ([scheme isEqualToString:@"cydia"])      return NO;
+        if ([scheme isEqualToString:@"zbra"])        return NO;
+        if ([scheme isEqualToString:@"undecimus"])   return NO;
+        if ([scheme isEqualToString:@"activator"])   return NO;
+        if ([scheme isEqualToString:@"apt-repo"])    return NO;
+        // sileo:// и filza:// НЕ блокируем — это легитимные deeplinks
     }
     return %orig;
 }
 
 - (BOOL)openURL:(NSURL *)url {
+    if (_jb_is_trusted_app()) return %orig;
     NSString *scheme = url.scheme.lowercaseString;
-    if (scheme && ([scheme isEqualToString:@"cydia"] ||
-                   [scheme isEqualToString:@"sileo"] ||
-                   [scheme isEqualToString:@"zbra"] ||
-                   [scheme isEqualToString:@"filza"])) return NO;
+    if (scheme && [scheme isEqualToString:@"cydia"]) return NO;
     return %orig;
 }
 
@@ -193,6 +248,8 @@ static void *hook_dlopen(const char *path, int mode) {
     @autoreleasepool {
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         if (!bid) return;
+
+        // В системных процессах Apple не вешаем ничего
         if ([bid hasPrefix:@"com.apple."]) return;
 
         MSHookFunction((void *)stat,    (void *)hook_stat,    (void **)&orig_stat);
@@ -201,7 +258,6 @@ static void *hook_dlopen(const char *path, int mode) {
         MSHookFunction((void *)open,    (void *)hook_open,    (void **)&orig_open);
         MSHookFunction((void *)fopen,   (void *)hook_fopen,   (void **)&orig_fopen);
         MSHookFunction((void *)opendir, (void *)hook_opendir, (void **)&orig_opendir);
-        MSHookFunction((void *)fork,    (void *)hook_fork,    (void **)&orig_fork);
         MSHookFunction((void *)getenv,  (void *)hook_getenv,  (void **)&orig_getenv);
         MSHookFunction((void *)dlopen,  (void *)hook_dlopen,  (void **)&orig_dlopen);
 
