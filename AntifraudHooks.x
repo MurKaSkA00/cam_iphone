@@ -1,5 +1,4 @@
-// AntifraudHooks.x - MediaPlaybackUtils v1.4.6
-
+// AntifraudHooks.x - MediaPlaybackUtils v1.5.2
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -7,8 +6,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
-
-extern const void *kOverlayLayerKey;
+#import "MPUKeys.h"
 
 static NSString *(*orig_NSStringFromClass)(Class) = NULL;
 static NSString *hook_NSStringFromClass(Class cls) {
@@ -43,7 +41,6 @@ static NSString *hook_NSStringFromClass(Class cls) {
         MSHookFunction((void *)NSStringFromClass,
                        (void *)hook_NSStringFromClass,
                        (void **)&orig_NSStringFromClass);
-
         %init;
         NSLog(@"[MPU/AntiIntrospect] Installed for %@", bid);
     }
