@@ -20,7 +20,12 @@ static NSString *hook_NSStringFromClass(Class cls) {
 
 static id (*orig_objc_getAssociatedObject)(id, const void *) = NULL;
 static id hook_objc_getAssociatedObject(id object, const void *key) {
-    if (key && strcmp((const char *)key, "_v_overlay") == 0) return nil;
+    // Безопасная проверка — только если key похож на C-строку
+    if (key) {
+        @try {
+            if (strcmp((const char *)key, "_v_overlay") == 0) return nil;
+        } @catch (...) {}
+    }
     return orig_objc_getAssociatedObject(object, key);
 }
 
