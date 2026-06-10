@@ -14,7 +14,7 @@
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
 static BOOL _enabled = YES;
-static NSString *_url = @"http://192.168.1.44:8888/live";
+static NSString *_url = @"http://192.168.1.44:8888/live/stream/index.m3u8";
 static _MPUMediaBufferAdapter *_reader = nil;
 static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
@@ -259,6 +259,23 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
     return %orig;
 }
 
+- (NSData *)embeddedThumbnailPhotoSegmentData {
+    @synchronized(_v_lock) {
+        if (_enabled && _lastBuffer) {
+            CIImage *ci = [CIImage imageWithCVPixelBuffer:_lastBuffer];
+            CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
+            if (!cg) return %orig;
+            // Уменьшаем до размера thumbnail
+            UIGraphicsBeginImageContext(CGSizeMake(160, 120));
+            [[UIImage imageWithCGImage:cg] drawInRect:CGRectMake(0,0,160,120)];
+            UIImage *thumb = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
+            CGImageRelease(cg);
+            return UIImageJPEGRepresentation(thumb, 0.8);
+        }
+    }
+    return %orig;
+}
 %end
 
 // ========================================
