@@ -36,6 +36,9 @@ static void _v_loadPrefs(void) {
     }
 }
 
+// FIX: forward declaration — объявляем до первого использования в _v_prefsChanged
+static void _v_startStream(void);
+
 static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
                              CFStringRef name, const void *object,
                              CFDictionaryRef userInfo) {
