@@ -1,4 +1,4 @@
-// Tweak.x - MediaPlaybackUtils v1.4.2
+// Tweak.x - MediaPlaybackUtils v1.4.3 (fixed)
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -11,19 +11,13 @@
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
 static BOOL _enabled = YES;
-// ИСПРАВЛЕНИЕ: убрали инициализацию строкой @"http://..." на уровне файла.
-// Компилятор разбирал "http:" как метку (label) языка C, а "//..." — как комментарий,
-// из-за чего переменная _url фактически не объявлялась → 9 ошибок "undeclared identifier".
-// Теперь значение по умолчанию выставляется внутри _v_loadPrefs(), где это безопасно.
-static NSString *_url = nil;
-
+static NSString *_url = @"http://192.168.1.44:8888/live";
 static _MPUMediaBufferAdapter *_reader = nil;
 static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
 static CIContext *_v_ciContext = nil;
 
 static void _v_loadPrefs(void) {
-    // Rootless-safe: использует CFPreferences вместо хардкод-пути
     CFPropertyListRef en = CFPreferencesCopyAppValue(CFSTR("enabled"), MPU_PREFS_ID);
     if (en) {
         if (CFGetTypeID(en) == CFBooleanGetTypeID()) {
@@ -40,40 +34,14 @@ static void _v_loadPrefs(void) {
         }
         CFRelease(u);
     }
-
-    // ИСПРАВЛЕНИЕ: дефолтный URL теперь здесь — внутри функции строковый литерал
-    // с "http://" парсится корректно и не путается с C-меткой.
-    if (!_url) _url = @"http://192.168.1.44:8888/live/stream/index.m3u8";
 }
 
 static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
                              CFStringRef name, const void *object,
                              CFDictionaryRef userInfo) {
     CFPreferencesAppSynchronize(MPU_PREFS_ID);
-    NSString *oldURL = [_url copy];
     _v_loadPrefs();
     NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
-
-    // Если URL изменился и стрим уже запущен — перезапускаем
-    if (_v_lock && _reader && ![oldURL isEqualToString:_url]) {
-        NSLog(@"[MPU] URL changed, restarting stream...");
-        [_reader stopStreaming];
-        _reader = nil;
-        // _v_init() использует dispatch_once, поэтому сбрасываем через пересоздание адаптера напрямую
-        NSURL *newU = [NSURL URLWithString:_url];
-        if (newU) {
-            _reader = [[_MPUMediaBufferAdapter alloc] initWithURL:newU];
-            _reader.pixelBufferCallback = ^(CVPixelBufferRef buffer) {
-                if (!buffer) return;
-                @synchronized(_v_lock) {
-                    if (_lastBuffer) CVPixelBufferRelease(_lastBuffer);
-                    _lastBuffer = CVPixelBufferRetain(buffer);
-                }
-            };
-            [_reader startStreaming];
-            NSLog(@"[MPU] Stream restarted with new URL: %@", _url);
-        }
-    }
 }
 
 static void _v_init(void) {
@@ -95,8 +63,6 @@ static void _v_init(void) {
     });
 }
 
-// Создаём новый CMSampleBuffer из _lastBuffer с таймингом оригинала (или дефолтным).
-// Возвращает retained буфер — вызывающий обязан освободить, либо NULL.
 static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef original) {
     CVPixelBufferRef src = NULL;
     @synchronized(_v_lock) {
@@ -112,11 +78,11 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
     CMSampleTimingInfo timing;
     if (original && CMSampleBufferGetSampleTimingInfo(original, 0, &timing) == noErr) {
-        // используем тайминг оригинального буфера
+        // keep original timing
     } else {
-        timing.duration               = CMTimeMake(1, 30);
-        timing.presentationTimeStamp  = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-        timing.decodeTimeStamp        = kCMTimeInvalid;
+        timing.duration = CMTimeMake(1, 30);
+        timing.presentationTimeStamp = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
+        timing.decodeTimeStamp = kCMTimeInvalid;
     }
 
     CMSampleBufferRef out = NULL;
@@ -127,7 +93,7 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 }
 
 // ========================================
-// 1. ПЕРЕХВАТ ДЕЛЕГАТА ВИДЕО-ВЫВОДА (правильный swizzling)
+// 1. ПЕРЕХВАТ ДЕЛЕГАТА ВИДЕО-ВЫВОДА
 // ========================================
 
 %hook AVCaptureVideoDataOutput
@@ -170,8 +136,6 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
                     if (replacement) CFRelease(replacement);
                 });
 
-                // Безопасно: добавляем override на cls. Если метод УЖЕ на cls (не inherited) —
-                // используем class_replaceMethod, чтобы НЕ мутировать суперкласс.
                 if (!class_addMethod(cls, sel, newIMP, types)) {
                     origIMP = class_replaceMethod(cls, sel, newIMP, types);
                 }
@@ -188,15 +152,25 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 // ========================================
 // 2. ПЕРЕХВАТ ФОТО-ЗАХВАТА
+// FIX: ждём буфер до 500мс если стрим ещё не прогрелся
 // ========================================
 
 %hook AVCapturePhoto
 
 - (CVPixelBufferRef)pixelBuffer {
+    // Ждём буфер если ещё не пришёл
+    if (_enabled && !_lastBuffer) {
+        for (int i = 0; i < 50; i++) {
+            [NSThread sleepForTimeInterval:0.01];
+            @synchronized(_v_lock) {
+                if (_lastBuffer) break;
+            }
+        }
+    }
+
     @synchronized(_v_lock) {
         if (_enabled && _lastBuffer) {
             NSLog(@"[MPU] Returning virtual buffer for photo");
-            // Getter-семантика: возвращаем autoreleased, чтобы избежать утечки
             return (CVPixelBufferRef)CFAutorelease(CFRetain(_lastBuffer));
         }
     }
@@ -204,24 +178,43 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 }
 
 - (NSData *)fileDataRepresentation {
-    @synchronized(_v_lock) {
-        if (_enabled && _lastBuffer) {
-            CIImage *ci = [CIImage imageWithCVPixelBuffer:_lastBuffer];
-            CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
-            if (!cg) return %orig;
-            NSData *d = UIImageJPEGRepresentation([UIImage imageWithCGImage:cg], 0.9);
-            CGImageRelease(cg);
-            NSLog(@"[MPU] Returning virtual photo data");
-            return d;
+    // Ждём буфер если ещё не пришёл
+    if (_enabled && !_lastBuffer) {
+        for (int i = 0; i < 50; i++) {
+            [NSThread sleepForTimeInterval:0.01];
+            @synchronized(_v_lock) {
+                if (_lastBuffer) break;
+            }
         }
     }
+
+    CVPixelBufferRef snapBuffer = NULL;
+    @synchronized(_v_lock) {
+        if (_enabled && _lastBuffer) {
+            snapBuffer = CVPixelBufferRetain(_lastBuffer);
+        }
+    }
+
+    if (snapBuffer) {
+        CIImage *ci = [CIImage imageWithCVPixelBuffer:snapBuffer];
+        // FIX: используем глобальный _v_ciContext, он точно инициализирован в %ctor
+        CGImageRef cg = [_v_ciContext createCGImage:ci fromRect:ci.extent];
+        CVPixelBufferRelease(snapBuffer);
+        if (!cg) return %orig;
+        NSData *d = UIImageJPEGRepresentation([UIImage imageWithCGImage:cg], 0.9);
+        CGImageRelease(cg);
+        NSLog(@"[MPU] Returning virtual photo data");
+        return d;
+    }
+
     return %orig;
 }
 
 %end
 
 // ========================================
-// 3. ПЕРЕХВАТ ПРЕДПРОСМОТРА КАМЕРЫ (визуальная подмена)
+// 3. ПЕРЕХВАТ ПРЕДПРОСМОТРА КАМЕРЫ
+// FIX: CADisplayLink для постоянного live-обновления вместо разового layoutSublayers
 // ========================================
 
 %hook AVCaptureVideoPreviewLayer
@@ -229,41 +222,63 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 - (void)layoutSublayers {
     %orig;
     if (!_enabled) return;
-
     _v_init();
 
     CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
     if (!overlay) {
         overlay = [CALayer layer];
         overlay.contentsGravity = kCAGravityResizeAspectFill;
-        overlay.zPosition       = 999999;
+        overlay.zPosition = 999999;
         overlay.backgroundColor = [UIColor blackColor].CGColor;
-        overlay.opaque          = YES;
+        overlay.opaque = YES;
         [self addSublayer:overlay];
         objc_setAssociatedObject(self, "_v_overlay", overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        // FIX: запускаем CADisplayLink для постоянного обновления кадров из стрима
+        CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self
+                                                          selector:@selector(_v_updateOverlayFrame:)];
+        link.preferredFramesPerSecond = 30;
+        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        objc_setAssociatedObject(self, "_v_displayLink", link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        NSLog(@"[MPU] CADisplayLink started for preview layer");
     }
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    overlay.frame   = self.bounds;
-    overlay.hidden  = NO;
+    overlay.frame = self.bounds;
+    overlay.hidden = NO;
     overlay.opacity = 1.0;
+    [CATransaction commit];
+}
+
+// FIX: новый метод — вызывается CADisplayLink каждый кадр
+%new
+- (void)_v_updateOverlayFrame:(CADisplayLink *)link {
+    if (!_enabled) return;
+
+    CALayer *overlay = objc_getAssociatedObject(self, "_v_overlay");
+    if (!overlay) return;
 
     @synchronized(_v_lock) {
         if (_lastBuffer) {
             IOSurfaceRef surf = CVPixelBufferGetIOSurface(_lastBuffer);
             if (surf) {
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
                 overlay.contents = (__bridge id)surf;
+                overlay.frame = self.bounds;
+                overlay.hidden = NO;
+                [CATransaction commit];
             }
         }
     }
-    [CATransaction commit];
 }
 
 %end
 
 // ========================================
-// 4. ПРОГРЕВ: перехват создания устройства камеры
+// 4. ПРОГРЕВ СТРИМА ПРИ СОЗДАНИИ УСТРОЙСТВА
 // ========================================
 
 %hook AVCaptureDevice
@@ -292,33 +307,32 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
 
 %ctor {
     @autoreleasepool {
-        NSString *bid  = [[NSBundle mainBundle] bundleIdentifier];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         NSString *exec = [[NSBundle mainBundle] executablePath].lastPathComponent ?: @"";
 
-        // Не активируем в SpringBoard и системных демонах
         if (!bid) return;
-        if ([bid hasPrefix:@"com.apple.springboard"])    return;
-        if ([bid hasPrefix:@"com.apple.WebKit"])         return;
-        if ([bid hasPrefix:@"com.apple.mediaserverd"])   return;
-        if ([bid hasPrefix:@"com.apple.assetsd"])        return;
-        if ([bid hasPrefix:@"com.apple.coremedia"])      return;
-        if ([bid hasPrefix:@"com.apple.avconferenced"])  return;
+        if ([bid hasPrefix:@"com.apple.springboard"]) return;
+        if ([bid hasPrefix:@"com.apple.WebKit"]) return;
+        if ([bid hasPrefix:@"com.apple.mediaserverd"]) return;
+        if ([bid hasPrefix:@"com.apple.assetsd"]) return;
+        if ([bid hasPrefix:@"com.apple.coremedia"]) return;
+        if ([bid hasPrefix:@"com.apple.avconferenced"]) return;
         if ([bid hasPrefix:@"com.apple.cameracaptured"]) return;
 
         NSString *path = [[NSBundle mainBundle] bundlePath];
-        if ([path hasPrefix:@"/usr/"])                                  return;
-        if ([path hasPrefix:@"/System/Library/PrivateFrameworks/"])     return;
-        if ([path hasPrefix:@"/System/Library/Frameworks/"])            return;
+        if ([path hasPrefix:@"/usr/"]) return;
+        if ([path hasPrefix:@"/System/Library/PrivateFrameworks/"]) return;
+        if ([path hasPrefix:@"/System/Library/Frameworks/"]) return;
 
-        // Инициализируем lock и CIContext ДО любых хуков
-        _v_lock     = [NSObject new];
-        _v_ciContext = [CIContext contextWithOptions:nil];
+        // FIX: инициализируем lock и CIContext ДО чего-либо ещё
+        _v_lock = [NSObject new];
+        _v_ciContext = [CIContext contextWithOptions:@{
+            kCIContextUseSoftwareRenderer: @NO,
+            kCIContextWorkingColorSpace: (__bridge id)CGColorSpaceCreateDeviceRGB()
+        }];
 
-        // Читаем prefs через CFPreferences (rootless-safe)
-        // _url получает дефолтное значение здесь же, если не задан в настройках
         _v_loadPrefs();
 
-        // Подписываемся на изменения prefs (live update без перезапуска приложения)
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
             NULL, _v_prefsChanged,
@@ -328,6 +342,12 @@ static CMSampleBufferRef _v_makeReplacementSampleBuffer(CMSampleBufferRef origin
         if (_enabled) {
             NSLog(@"[MPU] Tweak enabled for bundle: %@ (exec=%@, url=%@)", bid, exec, _url);
             %init;
+
+            // FIX: прогреваем стрим сразу при инъекции твика, не ждём первого вызова камеры
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                _v_init();
+            });
         } else {
             NSLog(@"[MPU] Tweak disabled in preferences for: %@", bid);
         }
