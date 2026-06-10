@@ -11,7 +11,7 @@
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
 static BOOL _enabled = YES;
-static NSString *_url = @"http://192.168.1.44:8888/live";
+static NSString *_url = @"http://192.168.1.44:8888/live/stream/index.m3u8";
 static _MPUMediaBufferAdapter *_reader = nil;
 static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
@@ -40,26 +40,42 @@ static void _v_prefsChanged(CFNotificationCenterRef center, void *observer,
                              CFStringRef name, const void *object,
                              CFDictionaryRef userInfo) {
     CFPreferencesAppSynchronize(MPU_PREFS_ID);
+    NSString *oldURL = [_url copy];
     _v_loadPrefs();
     NSLog(@"[MPU] Preferences reloaded: enabled=%d url=%@", _enabled, _url);
+    // Перезапускаем стрим если URL изменился
+    if (![oldURL isEqualToString:_url]) {
+        NSLog(@"[MPU] URL changed, restarting stream...");
+        _v_startStream();
+    }
+}
+
+static void _v_startStream(void) {
+    NSURL *u = [NSURL URLWithString:_url];
+    if (!u) {
+        NSLog(@"[MPU] Invalid stream URL: %@", _url);
+        return;
+    }
+    if (_reader) {
+        [_reader stopStreaming];
+        _reader = nil;
+    }
+    _reader = [[_MPUMediaBufferAdapter alloc] initWithURL:u];
+    _reader.pixelBufferCallback = ^(CVPixelBufferRef buffer) {
+        if (!buffer) return;
+        @synchronized(_v_lock) {
+            if (_lastBuffer) CVPixelBufferRelease(_lastBuffer);
+            _lastBuffer = CVPixelBufferRetain(buffer);
+        }
+    };
+    [_reader startStreaming];
+    NSLog(@"[MPU] Stream started: %@", _url);
 }
 
 static void _v_init(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSURL *u = [NSURL URLWithString:_url];
-        if (!u) return;
-
-        _reader = [[_MPUMediaBufferAdapter alloc] initWithURL:u];
-        _reader.pixelBufferCallback = ^(CVPixelBufferRef buffer) {
-            if (!buffer) return;
-            @synchronized(_v_lock) {
-                if (_lastBuffer) CVPixelBufferRelease(_lastBuffer);
-                _lastBuffer = CVPixelBufferRetain(buffer);
-            }
-        };
-        [_reader startStreaming];
-        NSLog(@"[MPU] Stream initialized and started: %@", _url);
+        _v_startStream();
     });
 }
 
