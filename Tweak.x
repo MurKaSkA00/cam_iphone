@@ -11,7 +11,7 @@
 #define MPU_PREFS_ID CFSTR("com.proximacore.mediaplaybackutils")
 
 static BOOL _enabled = YES;
-static NSString *_url = @"http://192.168.1.44:8888/live";
+static NSString *_url = @"http://192.168.1.44:8888/live/stream/index.m3u8";
 static _MPUMediaBufferAdapter *_reader = nil;
 static CVPixelBufferRef _lastBuffer = NULL;
 static id _v_lock = nil;
